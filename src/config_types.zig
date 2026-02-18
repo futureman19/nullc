@@ -124,6 +124,7 @@ pub const DiscordConfig = struct {
     listen_to_bots: bool = false,
     allowed_users: []const []const u8 = &.{},
     mention_only: bool = false,
+    intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
 };
 
 pub const SlackConfig = struct {
