@@ -3,10 +3,12 @@ const Tool = @import("root.zig").Tool;
 const ToolResult = @import("root.zig").ToolResult;
 const parseStringField = @import("shell.zig").parseStringField;
 const isPathSafe = @import("file_edit.zig").isPathSafe;
+const isResolvedPathAllowed = @import("file_edit.zig").isResolvedPathAllowed;
 
 /// Write file contents with workspace path scoping.
 pub const FileWriteTool = struct {
     workspace_dir: []const u8,
+    allowed_paths: []const []const u8 = &.{},
 
     const vtable = Tool.VTable{
         .execute = &vtableExecute,
@@ -42,19 +44,24 @@ pub const FileWriteTool = struct {
     }
 
     fn execute(self: *FileWriteTool, allocator: std.mem.Allocator, args_json: []const u8) !ToolResult {
-        const rel_path = parseStringField(args_json, "path") orelse
+        const path = parseStringField(args_json, "path") orelse
             return ToolResult.fail("Missing 'path' parameter");
 
         const content = parseStringField(args_json, "content") orelse
             return ToolResult.fail("Missing 'content' parameter");
 
-        // Block path traversal
-        if (!isPathSafe(rel_path)) {
-            return ToolResult.fail("Path not allowed: contains traversal or absolute path");
-        }
-
-        // Build full path
-        const full_path = try std.fs.path.join(allocator, &.{ self.workspace_dir, rel_path });
+        // Build full path — absolute or relative
+        const full_path = if (path.len > 0 and path[0] == '/') blk: {
+            if (self.allowed_paths.len == 0)
+                return ToolResult.fail("Absolute paths not allowed (no allowed_paths configured)");
+            if (std.mem.indexOfScalar(u8, path, 0) != null)
+                return ToolResult.fail("Path contains null bytes");
+            break :blk try allocator.dupe(u8, path);
+        } else blk: {
+            if (!isPathSafe(path))
+                return ToolResult.fail("Path not allowed: contains traversal or absolute path");
+            break :blk try std.fs.path.join(allocator, &.{ self.workspace_dir, path });
+        };
         defer allocator.free(full_path);
 
         // Ensure parent directory exists
@@ -62,7 +69,6 @@ pub const FileWriteTool = struct {
             std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => {
-                    // Try creating intermediate dirs
                     std.fs.cwd().makePath(parent) catch |e| {
                         const msg = try std.fmt.allocPrint(allocator, "Failed to create directory: {}", .{e});
                         return ToolResult{ .success = false, .output = "", .error_msg = msg };
@@ -70,20 +76,18 @@ pub const FileWriteTool = struct {
                 },
             };
 
-            // Resolve parent to block symlink escapes
+            // Resolve parent to validate against policy
             const resolved_parent = std.fs.cwd().realpathAlloc(allocator, parent) catch |err| {
                 const msg = try std.fmt.allocPrint(allocator, "Failed to resolve path: {}", .{err});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
             defer allocator.free(resolved_parent);
 
-            const ws_resolved = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch {
-                return ToolResult.fail("Failed to resolve workspace directory");
-            };
-            defer allocator.free(ws_resolved);
+            const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
+            defer if (ws_resolved) |wr| allocator.free(wr);
 
-            if (!std.mem.startsWith(u8, resolved_parent, ws_resolved)) {
-                return ToolResult.fail("Resolved path escapes workspace");
+            if (!isResolvedPathAllowed(allocator, resolved_parent, ws_resolved orelse "", self.allowed_paths)) {
+                return ToolResult.fail("Path is outside allowed areas");
             }
         }
 
@@ -99,7 +103,7 @@ pub const FileWriteTool = struct {
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
 
-        const msg = try std.fmt.allocPrint(allocator, "Written {d} bytes to {s}", .{ content.len, rel_path });
+        const msg = try std.fmt.allocPrint(allocator, "Written {d} bytes to {s}", .{ content.len, path });
         return ToolResult{ .success = true, .output = msg };
     }
 };

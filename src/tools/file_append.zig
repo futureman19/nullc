@@ -8,6 +8,7 @@ const Tool = @import("root.zig").Tool;
 const ToolResult = @import("root.zig").ToolResult;
 const parseStringField = @import("shell.zig").parseStringField;
 const isPathSafe = @import("file_edit.zig").isPathSafe;
+const isResolvedPathAllowed = @import("file_edit.zig").isResolvedPathAllowed;
 
 /// Maximum file size to read before appending (10MB).
 const MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
@@ -15,6 +16,7 @@ const MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
 /// Append content to the end of a file with workspace path scoping.
 pub const FileAppendTool = struct {
     workspace_dir: []const u8,
+    allowed_paths: []const []const u8 = &.{},
 
     const vtable = Tool.VTable{
         .execute = &vtableExecute,
@@ -50,26 +52,30 @@ pub const FileAppendTool = struct {
     }
 
     fn execute(self: *FileAppendTool, allocator: std.mem.Allocator, args_json: []const u8) !ToolResult {
-        const rel_path = parseStringField(args_json, "path") orelse
+        const path = parseStringField(args_json, "path") orelse
             return ToolResult.fail("Missing 'path' parameter");
 
         const content = parseStringField(args_json, "content") orelse
             return ToolResult.fail("Missing 'content' parameter");
 
-        // Block path traversal
-        if (!isPathSafe(rel_path)) {
-            return ToolResult.fail("Path not allowed: contains traversal or absolute path");
-        }
-
-        // Build full path
-        const full_path = try std.fs.path.join(allocator, &.{ self.workspace_dir, rel_path });
+        // Build full path — absolute or relative
+        const full_path = if (path.len > 0 and path[0] == '/') blk: {
+            if (self.allowed_paths.len == 0)
+                return ToolResult.fail("Absolute paths not allowed (no allowed_paths configured)");
+            if (std.mem.indexOfScalar(u8, path, 0) != null)
+                return ToolResult.fail("Path contains null bytes");
+            break :blk try allocator.dupe(u8, path);
+        } else blk: {
+            if (!isPathSafe(path))
+                return ToolResult.fail("Path not allowed: contains traversal or absolute path");
+            break :blk try std.fs.path.join(allocator, &.{ self.workspace_dir, path });
+        };
         defer allocator.free(full_path);
 
-        // Resolve workspace path
-        const ws_resolved = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch {
-            return ToolResult.fail("Failed to resolve workspace directory");
-        };
-        defer allocator.free(ws_resolved);
+        // Resolve workspace path (may fail if workspace doesn't exist yet)
+        const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
+        defer if (ws_resolved) |wr| allocator.free(wr);
+        const ws_str = ws_resolved orelse "";
 
         // Try to read existing content
         const existing = blk: {
@@ -78,8 +84,8 @@ pub const FileAppendTool = struct {
             };
             defer allocator.free(resolved);
 
-            if (!std.mem.startsWith(u8, resolved, ws_resolved)) {
-                return ToolResult.fail("Resolved path escapes workspace");
+            if (!isResolvedPathAllowed(allocator, resolved, ws_str, self.allowed_paths)) {
+                return ToolResult.fail("Path is outside allowed areas");
             }
 
             const file = std.fs.openFileAbsolute(resolved, .{}) catch |err| {
@@ -115,20 +121,20 @@ pub const FileAppendTool = struct {
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
 
-        // Verify newly created files are within workspace
+        // Verify newly created files are within allowed areas
         if (existing == null) {
             const new_resolved = std.fs.cwd().realpathAlloc(allocator, full_path) catch {
                 std.fs.cwd().deleteFile(full_path) catch {};
-                return ToolResult.fail("Failed to verify created file is within workspace");
+                return ToolResult.fail("Failed to verify created file location");
             };
             defer allocator.free(new_resolved);
-            if (!std.mem.startsWith(u8, new_resolved, ws_resolved)) {
+            if (!isResolvedPathAllowed(allocator, new_resolved, ws_str, self.allowed_paths)) {
                 std.fs.cwd().deleteFile(full_path) catch {};
-                return ToolResult.fail("Created file escapes workspace");
+                return ToolResult.fail("Created file is outside allowed areas");
             }
         }
 
-        const msg = try std.fmt.allocPrint(allocator, "Appended {d} bytes to {s}", .{ content.len, rel_path });
+        const msg = try std.fmt.allocPrint(allocator, "Appended {d} bytes to {s}", .{ content.len, path });
         return ToolResult{ .success = true, .output = msg };
     }
 };

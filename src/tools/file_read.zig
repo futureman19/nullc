@@ -3,6 +3,7 @@ const Tool = @import("root.zig").Tool;
 const ToolResult = @import("root.zig").ToolResult;
 const parseStringField = @import("shell.zig").parseStringField;
 const isPathSafe = @import("file_edit.zig").isPathSafe;
+const isResolvedPathAllowed = @import("file_edit.zig").isResolvedPathAllowed;
 
 /// Maximum file size to read (10MB).
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
@@ -10,6 +11,7 @@ const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 /// Read file contents with workspace path scoping.
 pub const FileReadTool = struct {
     workspace_dir: []const u8,
+    allowed_paths: []const []const u8 = &.{},
 
     const vtable = Tool.VTable{
         .execute = &vtableExecute,
@@ -45,16 +47,21 @@ pub const FileReadTool = struct {
     }
 
     fn execute(self: *FileReadTool, allocator: std.mem.Allocator, args_json: []const u8) !ToolResult {
-        const rel_path = parseStringField(args_json, "path") orelse
+        const path = parseStringField(args_json, "path") orelse
             return ToolResult.fail("Missing 'path' parameter");
 
-        // Block path traversal
-        if (!isPathSafe(rel_path)) {
-            return ToolResult.fail("Path not allowed: contains traversal or absolute path");
-        }
-
-        // Build full path
-        const full_path = try std.fs.path.join(allocator, &.{ self.workspace_dir, rel_path });
+        // Build full path — absolute or relative
+        const full_path = if (path.len > 0 and path[0] == '/') blk: {
+            if (self.allowed_paths.len == 0)
+                return ToolResult.fail("Absolute paths not allowed (no allowed_paths configured)");
+            if (std.mem.indexOfScalar(u8, path, 0) != null)
+                return ToolResult.fail("Path contains null bytes");
+            break :blk try allocator.dupe(u8, path);
+        } else blk: {
+            if (!isPathSafe(path))
+                return ToolResult.fail("Path not allowed: contains traversal or absolute path");
+            break :blk try std.fs.path.join(allocator, &.{ self.workspace_dir, path });
+        };
         defer allocator.free(full_path);
 
         // Resolve to catch symlink escapes
@@ -64,14 +71,12 @@ pub const FileReadTool = struct {
         };
         defer allocator.free(resolved);
 
-        // Ensure resolved path is still within workspace
-        const ws_resolved = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch {
-            return ToolResult.fail("Failed to resolve workspace directory");
-        };
-        defer allocator.free(ws_resolved);
+        // Validate against workspace + allowed_paths + system blocklist
+        const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
+        defer if (ws_resolved) |wr| allocator.free(wr);
 
-        if (!std.mem.startsWith(u8, resolved, ws_resolved)) {
-            return ToolResult.fail("Resolved path escapes workspace");
+        if (!isResolvedPathAllowed(allocator, resolved, ws_resolved orelse "", self.allowed_paths)) {
+            return ToolResult.fail("Path is outside allowed areas");
         }
 
         // Check file size
@@ -223,4 +228,34 @@ test "isPathSafe blocks null bytes" {
 test "isPathSafe allows relative" {
     try std.testing.expect(isPathSafe("file.txt"));
     try std.testing.expect(isPathSafe("src/main.zig"));
+}
+
+test "file_read absolute path without allowed_paths is rejected" {
+    var ft = FileReadTool{ .workspace_dir = "/tmp" };
+    const t = ft.tool();
+    const result = try t.execute(std.testing.allocator, "{\"path\": \"/tmp/foo.txt\"}");
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Absolute paths not allowed") != null);
+}
+
+test "file_read absolute path with allowed_paths works" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(.{ .sub_path = "hello.txt", .data = "allowed content" });
+
+    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const abs_file = try std.fs.path.join(std.testing.allocator, &.{ ws_path, "hello.txt" });
+    defer std.testing.allocator.free(abs_file);
+
+    var args_buf: [512]u8 = undefined;
+    const args = try std.fmt.bufPrint(&args_buf, "{{\"path\": \"{s}\"}}", .{abs_file});
+
+    var ft = FileReadTool{ .workspace_dir = "/nonexistent", .allowed_paths = &.{ws_path} };
+    const result = try ft.execute(std.testing.allocator, args);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("allowed content", result.output);
 }

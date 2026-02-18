@@ -712,6 +712,20 @@ test "json parse autonomy allowed commands and forbidden paths" {
     allocator.free(cfg.autonomy.forbidden_paths);
 }
 
+test "json parse autonomy allowed_paths" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"autonomy": {"allowed_paths": ["/Users/igor/projects", "/tmp/scratch"]}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 2), cfg.autonomy.allowed_paths.len);
+    try std.testing.expectEqualStrings("/Users/igor/projects", cfg.autonomy.allowed_paths[0]);
+    try std.testing.expectEqualStrings("/tmp/scratch", cfg.autonomy.allowed_paths[1]);
+    for (cfg.autonomy.allowed_paths) |p| allocator.free(p);
+    allocator.free(cfg.autonomy.allowed_paths);
+}
+
 test "json parse gateway paired tokens" {
     const allocator = std.testing.allocator;
     const json =

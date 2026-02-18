@@ -129,27 +129,32 @@ pub fn defaultTools(
     allocator: std.mem.Allocator,
     workspace_dir: []const u8,
 ) ![]Tool {
+    return defaultToolsWithPaths(allocator, workspace_dir, &.{});
+}
+
+/// Create the default tool set with additional allowed paths.
+pub fn defaultToolsWithPaths(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    allowed_paths: []const []const u8,
+) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
     errdefer list.deinit(allocator);
 
-    // NOTE: Tool structs are heap-allocated to ensure they outlive the function scope.
-    // These allocations are not freed here - they live for the program duration.
-    // The caller is responsible for cleanup if needed.
-
     const st = try allocator.create(shell.ShellTool);
-    st.* = .{ .workspace_dir = workspace_dir };
+    st.* = .{ .workspace_dir = workspace_dir, .allowed_paths = allowed_paths };
     try list.append(allocator, st.tool());
 
     const ft = try allocator.create(file_read.FileReadTool);
-    ft.* = .{ .workspace_dir = workspace_dir };
+    ft.* = .{ .workspace_dir = workspace_dir, .allowed_paths = allowed_paths };
     try list.append(allocator, ft.tool());
 
     const wt = try allocator.create(file_write.FileWriteTool);
-    wt.* = .{ .workspace_dir = workspace_dir };
+    wt.* = .{ .workspace_dir = workspace_dir, .allowed_paths = allowed_paths };
     try list.append(allocator, wt.tool());
 
     const et = try allocator.create(file_edit.FileEditTool);
-    et.* = .{ .workspace_dir = workspace_dir };
+    et.* = .{ .workspace_dir = workspace_dir, .allowed_paths = allowed_paths };
     try list.append(allocator, et.tool());
 
     return list.toOwnedSlice(allocator);
@@ -171,30 +176,27 @@ pub fn allTools(
         fallback_api_key: ?[]const u8 = null,
         delegate_depth: u32 = 0,
         subagent_manager: ?*@import("../subagent.zig").SubagentManager = null,
+        allowed_paths: []const []const u8 = &.{},
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
     errdefer list.deinit(allocator);
 
-    // NOTE: Tool structs are heap-allocated to ensure they outlive the function scope.
-    // These allocations are not freed here - they live for the program duration.
-    // The caller is responsible for cleanup if needed.
-
-    // Core tools with workspace_dir
+    // Core tools with workspace_dir + allowed_paths
     const st = try allocator.create(shell.ShellTool);
-    st.* = .{ .workspace_dir = workspace_dir };
+    st.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
     try list.append(allocator, st.tool());
 
     const ft = try allocator.create(file_read.FileReadTool);
-    ft.* = .{ .workspace_dir = workspace_dir };
+    ft.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
     try list.append(allocator, ft.tool());
 
     const wt = try allocator.create(file_write.FileWriteTool);
-    wt.* = .{ .workspace_dir = workspace_dir };
+    wt.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
     try list.append(allocator, wt.tool());
 
     const et2 = try allocator.create(file_edit.FileEditTool);
-    et2.* = .{ .workspace_dir = workspace_dir };
+    et2.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
     try list.append(allocator, et2.tool());
 
     const gt = try allocator.create(git.GitTool);
@@ -298,25 +300,28 @@ pub fn allTools(
 pub fn subagentTools(
     allocator: std.mem.Allocator,
     workspace_dir: []const u8,
-    opts: struct { http_enabled: bool = false },
+    opts: struct {
+        http_enabled: bool = false,
+        allowed_paths: []const []const u8 = &.{},
+    },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
     errdefer list.deinit(allocator);
 
     const st = try allocator.create(shell.ShellTool);
-    st.* = .{ .workspace_dir = workspace_dir };
+    st.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
     try list.append(allocator, st.tool());
 
     const ft = try allocator.create(file_read.FileReadTool);
-    ft.* = .{ .workspace_dir = workspace_dir };
+    ft.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
     try list.append(allocator, ft.tool());
 
     const wt = try allocator.create(file_write.FileWriteTool);
-    wt.* = .{ .workspace_dir = workspace_dir };
+    wt.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
     try list.append(allocator, wt.tool());
 
     const et = try allocator.create(file_edit.FileEditTool);
-    et.* = .{ .workspace_dir = workspace_dir };
+    et.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
     try list.append(allocator, et.tool());
 
     const gt = try allocator.create(git.GitTool);

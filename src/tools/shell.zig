@@ -1,6 +1,7 @@
 const std = @import("std");
 const Tool = @import("root.zig").Tool;
 const ToolResult = @import("root.zig").ToolResult;
+const isResolvedPathAllowed = @import("file_edit.zig").isResolvedPathAllowed;
 
 /// Maximum shell command execution time (nanoseconds).
 const SHELL_TIMEOUT_NS: u64 = 60 * std.time.ns_per_s;
@@ -14,6 +15,7 @@ const SAFE_ENV_VARS = [_][]const u8{
 /// Shell command execution tool with workspace scoping.
 pub const ShellTool = struct {
     workspace_dir: []const u8,
+    allowed_paths: []const []const u8 = &.{},
 
     const vtable = Tool.VTable{
         .execute = &vtableExecute,
@@ -44,7 +46,7 @@ pub const ShellTool = struct {
 
     fn vtableParams(_: *anyopaque) []const u8 {
         return 
-        \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"}},"required":["command"]}
+        \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"cwd":{"type":"string","description":"Working directory (absolute path within allowed paths; defaults to workspace)"}},"required":["command"]}
         ;
     }
 
@@ -53,12 +55,37 @@ pub const ShellTool = struct {
         const command = parseStringField(args_json, "command") orelse
             return ToolResult.fail("Missing 'command' parameter");
 
+        // Determine working directory
+        const effective_cwd = if (parseStringField(args_json, "cwd")) |cwd| blk: {
+            // cwd must be absolute
+            if (cwd.len == 0 or cwd[0] != '/')
+                return ToolResult.fail("cwd must be an absolute path");
+            if (self.allowed_paths.len == 0)
+                return ToolResult.fail("cwd not allowed (no allowed_paths configured)");
+            // Resolve and validate
+            const resolved_cwd = std.fs.cwd().realpathAlloc(allocator, cwd) catch |err| {
+                const msg = try std.fmt.allocPrint(allocator, "Failed to resolve cwd: {}", .{err});
+                return ToolResult{ .success = false, .output = "", .error_msg = msg };
+            };
+            defer allocator.free(resolved_cwd);
+
+            const ws_resolved = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch {
+                return ToolResult.fail("Failed to resolve workspace directory");
+            };
+            defer allocator.free(ws_resolved);
+
+            if (!isResolvedPathAllowed(allocator, resolved_cwd, ws_resolved, self.allowed_paths))
+                return ToolResult.fail("cwd is outside allowed areas");
+
+            break :blk cwd;
+        } else self.workspace_dir;
+
         // Execute via /bin/sh -c
         var child = std.process.Child.init(
             &.{ "/bin/sh", "-c", command },
             allocator,
         );
-        child.cwd = self.workspace_dir;
+        child.cwd = effective_cwd;
 
         // Clear environment to prevent leaking API keys (CWE-200),
         // then re-add only safe, functional variables.
@@ -238,4 +265,38 @@ test "parseIntField positive" {
 test "parseIntField negative" {
     const json = "{\"offset\": -5}";
     try std.testing.expectEqual(@as(?i64, -5), parseIntField(json, "offset"));
+}
+
+test "shell cwd without allowed_paths is rejected" {
+    var st = ShellTool{ .workspace_dir = "/tmp" };
+    const result = try st.execute(std.testing.allocator, "{\"command\": \"pwd\", \"cwd\": \"/tmp\"}");
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "no allowed_paths") != null);
+}
+
+test "shell cwd relative path is rejected" {
+    var st = ShellTool{ .workspace_dir = "/tmp", .allowed_paths = &.{"/tmp"} };
+    const result = try st.execute(std.testing.allocator, "{\"command\": \"pwd\", \"cwd\": \"relative\"}");
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "absolute") != null);
+}
+
+test "shell cwd with allowed_paths runs in cwd" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var args_buf: [512]u8 = undefined;
+    const args = try std.fmt.bufPrint(&args_buf, "{{\"command\": \"pwd\", \"cwd\": \"{s}\"}}", .{tmp_path});
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .allowed_paths = &.{tmp_path} };
+    const result = try st.execute(std.testing.allocator, args);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, tmp_path) != null);
 }
