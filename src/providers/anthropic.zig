@@ -287,7 +287,7 @@ pub const AnthropicProvider = struct {
         const resp_body = if (is_oauth)
             curlPostOAuth(allocator, url, body, auth_hdr, version_hdr) catch return error.AnthropicApiError
         else
-            root.curlPost(allocator, url, body, &.{ auth_hdr, version_hdr }) catch return error.AnthropicApiError;
+            root.curlPostTimed(allocator, url, body, &.{ auth_hdr, version_hdr }, request.timeout_secs) catch return error.AnthropicApiError;
         defer allocator.free(resp_body);
 
         return parseNativeResponse(allocator, resp_body);
@@ -441,6 +441,13 @@ fn buildChatRequestBody(
     const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.AnthropicApiError;
     try buf.appendSlice(allocator, temp_str);
 
+    if (request.tools) |tools| {
+        if (tools.len > 0) {
+            try buf.appendSlice(allocator, ",\"tools\":");
+            try root.convertToolsAnthropic(&buf, allocator, tools);
+        }
+    }
+
     try buf.append(allocator, '}');
     return try buf.toOwnedSlice(allocator);
 }
@@ -498,6 +505,13 @@ fn buildStreamingChatRequestBody(
     var temp_buf: [16]u8 = undefined;
     const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.AnthropicApiError;
     try buf.appendSlice(allocator, temp_str);
+
+    if (request.tools) |tools| {
+        if (tools.len > 0) {
+            try buf.appendSlice(allocator, ",\"tools\":");
+            try root.convertToolsAnthropic(&buf, allocator, tools);
+        }
+    }
 
     try buf.appendSlice(allocator, ",\"stream\":true}");
     return try buf.toOwnedSlice(allocator);

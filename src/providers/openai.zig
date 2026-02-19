@@ -219,7 +219,7 @@ pub const OpenAiProvider = struct {
         const auth_hdr = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
         defer allocator.free(auth_hdr);
 
-        const resp_body = root.curlPost(allocator, BASE_URL, body, &.{auth_hdr}) catch return error.OpenAiApiError;
+        const resp_body = root.curlPostTimed(allocator, BASE_URL, body, &.{auth_hdr}, request.timeout_secs) catch return error.OpenAiApiError;
         defer allocator.free(resp_body);
 
         return parseNativeResponse(allocator, resp_body);
@@ -272,6 +272,14 @@ pub const OpenAiProvider = struct {
         const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{request.max_tokens}) catch return error.OpenAiApiError;
         try buf.appendSlice(allocator, max_str);
 
+        if (request.tools) |tools| {
+            if (tools.len > 0) {
+                try buf.appendSlice(allocator, ",\"tools\":");
+                try root.convertToolsOpenAI(&buf, allocator, tools);
+                try buf.appendSlice(allocator, ",\"tool_choice\":\"auto\"");
+            }
+        }
+
         try buf.appendSlice(allocator, ",\"stream\":true}");
         return try buf.toOwnedSlice(allocator);
     }
@@ -312,6 +320,14 @@ pub const OpenAiProvider = struct {
         var max_buf: [16]u8 = undefined;
         const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{request.max_tokens}) catch return error.OpenAiApiError;
         try buf.appendSlice(allocator, max_str);
+
+        if (request.tools) |tools| {
+            if (tools.len > 0) {
+                try buf.appendSlice(allocator, ",\"tools\":");
+                try root.convertToolsOpenAI(&buf, allocator, tools);
+                try buf.appendSlice(allocator, ",\"tool_choice\":\"auto\"");
+            }
+        }
 
         try buf.append(allocator, '}');
         return try buf.toOwnedSlice(allocator);

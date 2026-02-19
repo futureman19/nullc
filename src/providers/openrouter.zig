@@ -318,7 +318,7 @@ pub const OpenRouterProvider = struct {
         const title_hdr = try std.fmt.allocPrint(allocator, "X-Title: {s}", .{TITLE});
         defer allocator.free(title_hdr);
 
-        const resp_body = root.curlPost(allocator, BASE_URL, body, &.{ auth_hdr, referer_hdr, title_hdr }) catch return error.OpenRouterApiError;
+        const resp_body = root.curlPostTimed(allocator, BASE_URL, body, &.{ auth_hdr, referer_hdr, title_hdr }, request.timeout_secs) catch return error.OpenRouterApiError;
         defer allocator.free(resp_body);
 
         return parseNativeResponse(allocator, resp_body);
@@ -371,6 +371,14 @@ pub const OpenRouterProvider = struct {
         var max_buf: [16]u8 = undefined;
         const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{request.max_tokens}) catch return error.OpenRouterApiError;
         try buf.appendSlice(allocator, max_str);
+
+        if (request.tools) |tools| {
+            if (tools.len > 0) {
+                try buf.appendSlice(allocator, ",\"tools\":");
+                try root.convertToolsOpenAI(&buf, allocator, tools);
+                try buf.appendSlice(allocator, ",\"tool_choice\":\"auto\"");
+            }
+        }
 
         try buf.append(allocator, '}');
         return try buf.toOwnedSlice(allocator);

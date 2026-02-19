@@ -492,8 +492,8 @@ pub const OpenAiCompatibleProvider = struct {
         const resp_body = if (auth) |a| blk: {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "{s}: {s}", .{ a.name, a.value }) catch return error.CompatibleApiError;
-            break :blk root.curlPost(allocator, url, body, &.{auth_hdr}) catch return error.CompatibleApiError;
-        } else root.curlPost(allocator, url, body, &.{}) catch return error.CompatibleApiError;
+            break :blk root.curlPostTimed(allocator, url, body, &.{auth_hdr}, request.timeout_secs) catch return error.CompatibleApiError;
+        } else root.curlPostTimed(allocator, url, body, &.{}, request.timeout_secs) catch return error.CompatibleApiError;
         defer allocator.free(resp_body);
 
         return parseNativeResponse(allocator, resp_body);
@@ -578,6 +578,14 @@ fn buildChatRequestBody(
     var temp_buf: [16]u8 = undefined;
     const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.CompatibleApiError;
     try buf.appendSlice(allocator, temp_str);
+    if (request.tools) |tools| {
+        if (tools.len > 0) {
+            try buf.appendSlice(allocator, ",\"tools\":");
+            try root.convertToolsOpenAI(&buf, allocator, tools);
+            try buf.appendSlice(allocator, ",\"tool_choice\":\"auto\"");
+        }
+    }
+
     try buf.appendSlice(allocator, ",\"stream\":false}");
 
     return try buf.toOwnedSlice(allocator);
@@ -614,6 +622,14 @@ fn buildStreamingChatRequestBody(
     var temp_buf: [16]u8 = undefined;
     const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.CompatibleApiError;
     try buf.appendSlice(allocator, temp_str);
+    if (request.tools) |tools| {
+        if (tools.len > 0) {
+            try buf.appendSlice(allocator, ",\"tools\":");
+            try root.convertToolsOpenAI(&buf, allocator, tools);
+            try buf.appendSlice(allocator, ",\"tool_choice\":\"auto\"");
+        }
+    }
+
     try buf.appendSlice(allocator, ",\"stream\":true}");
 
     return try buf.toOwnedSlice(allocator);

@@ -208,6 +208,8 @@ pub const ChatRequest = struct {
     temperature: f64 = 0.7,
     max_tokens: u32 = 4096,
     tools: ?[]const ToolSpec = null,
+    /// Max seconds to wait for the HTTP response (curl --max-time). 0 = no limit.
+    timeout_secs: u64 = 0,
 };
 
 /// A single tool result message in a conversation.
@@ -966,8 +968,64 @@ pub fn buildRequestBodyWithSystem(allocator: std.mem.Allocator, model: []const u
 /// Re-export shared JSON string utility (used by sub-modules via `root.appendJsonString`).
 pub const appendJsonString = json_util.appendJsonString;
 
+/// Serialize tool definitions into an OpenAI-format JSON array, appending directly into `buf`.
+/// Format: [{"type":"function","function":{"name":"...","description":"...","parameters":{...}}}]
+pub fn convertToolsOpenAI(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, tools: []const ToolSpec) !void {
+    if (tools.len == 0) {
+        try buf.appendSlice(allocator, "[]");
+        return;
+    }
+    try buf.append(allocator, '[');
+    for (tools, 0..) |tool, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"type\":\"function\",\"function\":{\"name\":");
+        try json_util.appendJsonString(buf, allocator, tool.name);
+        try buf.appendSlice(allocator, ",\"description\":");
+        try json_util.appendJsonString(buf, allocator, tool.description);
+        try buf.appendSlice(allocator, ",\"parameters\":");
+        try buf.appendSlice(allocator, tool.parameters_json);
+        try buf.appendSlice(allocator, "}}");
+    }
+    try buf.append(allocator, ']');
+}
+
+/// Serialize tool definitions into an Anthropic-format JSON array, appending directly into `buf`.
+/// Format: [{"name":"...","description":"...","input_schema":{...}}]
+pub fn convertToolsAnthropic(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, tools: []const ToolSpec) !void {
+    if (tools.len == 0) {
+        try buf.appendSlice(allocator, "[]");
+        return;
+    }
+    try buf.append(allocator, '[');
+    for (tools, 0..) |tool, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, "{\"name\":");
+        try json_util.appendJsonString(buf, allocator, tool.name);
+        try buf.appendSlice(allocator, ",\"description\":");
+        try json_util.appendJsonString(buf, allocator, tool.description);
+        try buf.appendSlice(allocator, ",\"input_schema\":");
+        try buf.appendSlice(allocator, tool.parameters_json);
+        try buf.append(allocator, '}');
+    }
+    try buf.append(allocator, ']');
+}
+
 /// Re-export shared HTTP POST utility (used by sub-modules via `root.curlPost`).
 pub const curlPost = http_util.curlPost;
+
+/// Re-export proxy/timeout-aware HTTP POST (used by providers for LLM calls).
+pub const curlPostWithProxy = http_util.curlPostWithProxy;
+
+/// HTTP POST with optional LLM timeout (seconds). 0 = no limit.
+pub fn curlPostTimed(allocator: std.mem.Allocator, url: []const u8, body: []const u8, headers: []const []const u8, timeout_secs: u64) ![]u8 {
+    if (timeout_secs > 0) {
+        var timeout_buf: [16]u8 = undefined;
+        const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch
+            return http_util.curlPost(allocator, url, body, headers);
+        return http_util.curlPostWithProxy(allocator, url, body, headers, null, timeout_str);
+    }
+    return http_util.curlPost(allocator, url, body, headers);
+}
 
 /// Extract text content from a provider JSON response.
 pub fn extractContent(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
@@ -1045,6 +1103,83 @@ test "ChatResponse helpers" {
     };
     try std.testing.expect(with_tools.hasToolCalls());
     try std.testing.expectEqualStrings("Let me check", with_tools.contentOrEmpty());
+}
+
+test "convertToolsOpenAI produces valid JSON" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+    const tools = &[_]ToolSpec{
+        .{
+            .name = "shell",
+            .description = "Run a \"shell\" command",
+            .parameters_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}}",
+        },
+        .{
+            .name = "file_read",
+            .description = "Read a file",
+            .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}",
+        },
+    };
+    try convertToolsOpenAI(&buf, alloc, tools);
+    const json = buf.items;
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array;
+    try std.testing.expectEqual(@as(usize, 2), arr.items.len);
+
+    const t0 = arr.items[0].object;
+    try std.testing.expectEqualStrings("function", t0.get("type").?.string);
+    const f0 = t0.get("function").?.object;
+    try std.testing.expectEqualStrings("shell", f0.get("name").?.string);
+    // Description with quotes should be properly escaped
+    try std.testing.expect(std.mem.indexOf(u8, f0.get("description").?.string, "\"shell\"") != null);
+    try std.testing.expect(f0.get("parameters").? == .object);
+
+    const f1 = arr.items[1].object.get("function").?.object;
+    try std.testing.expectEqualStrings("file_read", f1.get("name").?.string);
+}
+
+test "convertToolsOpenAI empty tools" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+    try convertToolsOpenAI(&buf, alloc, &.{});
+    try std.testing.expectEqualStrings("[]", buf.items);
+}
+
+test "convertToolsAnthropic produces valid JSON" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+    const tools = &[_]ToolSpec{
+        .{
+            .name = "shell",
+            .description = "Run a command",
+            .parameters_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}}",
+        },
+    };
+    try convertToolsAnthropic(&buf, alloc, tools);
+    const json = buf.items;
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array;
+    try std.testing.expectEqual(@as(usize, 1), arr.items.len);
+
+    const t0 = arr.items[0].object;
+    try std.testing.expectEqualStrings("shell", t0.get("name").?.string);
+    try std.testing.expectEqualStrings("Run a command", t0.get("description").?.string);
+    try std.testing.expect(t0.get("input_schema").? == .object);
+}
+
+test "convertToolsAnthropic empty tools" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+    try convertToolsAnthropic(&buf, alloc, &.{});
+    try std.testing.expectEqualStrings("[]", buf.items);
 }
 
 test "providerUrl returns correct URLs" {
