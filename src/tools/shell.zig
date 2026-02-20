@@ -299,6 +299,9 @@ test "shell cwd relative path is rejected" {
 }
 
 test "shell cwd with allowed_paths runs in cwd" {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest; // pwd not available on Windows
+
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
     const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
@@ -310,7 +313,7 @@ test "shell cwd with allowed_paths runs in cwd" {
     const parsed = try root.parseTestArgs(args);
     defer parsed.deinit();
 
-    var st = ShellTool{ .workspace_dir = "/tmp", .allowed_paths = &.{tmp_path} };
+    var st = ShellTool{ .workspace_dir = ".", .allowed_paths = &.{tmp_path} };
     const result = try st.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
     defer if (result.error_msg) |e| std.testing.allocator.free(e);

@@ -266,8 +266,20 @@ test "file_read absolute path with allowed_paths works" {
     const abs_file = try std.fs.path.join(std.testing.allocator, &.{ ws_path, "hello.txt" });
     defer std.testing.allocator.free(abs_file);
 
-    var args_buf: [512]u8 = undefined;
-    const args = try std.fmt.bufPrint(&args_buf, "{{\"path\": \"{s}\"}}", .{abs_file});
+    // JSON-escape backslashes in the path (needed on Windows where paths use \)
+    var escaped_buf: [1024]u8 = undefined;
+    var esc_len: usize = 0;
+    for (abs_file) |c| {
+        if (c == '\\') {
+            escaped_buf[esc_len] = '\\';
+            esc_len += 1;
+        }
+        escaped_buf[esc_len] = c;
+        esc_len += 1;
+    }
+
+    var args_buf: [2048]u8 = undefined;
+    const args = try std.fmt.bufPrint(&args_buf, "{{\"path\": \"{s}\"}}", .{escaped_buf[0..esc_len]});
     const parsed = try root.parseTestArgs(args);
     defer parsed.deinit();
 
