@@ -60,6 +60,11 @@ fn parseCommand(arg: []const u8) ?Command {
 
 var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
 pub fn main() !void {
+    // Enable UTF-8 output on Windows console (fixes Cyrillic/Unicode garbling)
+    if (comptime builtin.os.tag == .windows) {
+        _ = std.os.windows.kernel32.SetConsoleOutputCP(65001);
+    }
+
     const allocator = comptime alloc: {
         if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) break :alloc debug_allocator.allocator();
         break :alloc std.heap.smp_allocator;
