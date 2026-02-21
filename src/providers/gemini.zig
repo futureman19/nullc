@@ -444,17 +444,22 @@ fn buildChatRequestBody(
                         try buf.append(allocator, '}');
                     },
                     .image_base64 => |img| {
-                        try buf.appendSlice(allocator, "{\"inlineData\":{\"mimeType\":\"");
-                        try buf.appendSlice(allocator, img.media_type);
-                        try buf.appendSlice(allocator, "\",\"data\":\"");
+                        try buf.appendSlice(allocator, "{\"inlineData\":{\"mimeType\":");
+                        try root.appendJsonString(&buf, allocator, img.media_type);
+                        try buf.appendSlice(allocator, ",\"data\":\"");
                         try buf.appendSlice(allocator, img.data);
                         try buf.appendSlice(allocator, "\"}}");
                     },
                     .image_url => |img| {
-                        // Gemini doesn't support direct URLs; include as text reference
-                        try buf.appendSlice(allocator, "{\"text\":\"[Image: ");
-                        try buf.appendSlice(allocator, img.url);
-                        try buf.appendSlice(allocator, "]\"}");
+                        // Gemini doesn't support direct URLs; include as escaped text reference
+                        try buf.appendSlice(allocator, "{\"text\":");
+                        var text_buf: std.ArrayListUnmanaged(u8) = .empty;
+                        defer text_buf.deinit(allocator);
+                        try text_buf.appendSlice(allocator, "[Image: ");
+                        try text_buf.appendSlice(allocator, img.url);
+                        try text_buf.appendSlice(allocator, "]");
+                        try root.appendJsonString(&buf, allocator, text_buf.items);
+                        try buf.append(allocator, '}');
                     },
                 }
             }
@@ -816,4 +821,24 @@ test "gemini buildChatRequestBody with content_parts inlineData" {
     const inline_data = parts.items[1].object.get("inlineData").?.object;
     try std.testing.expectEqualStrings("image/png", inline_data.get("mimeType").?.string);
     try std.testing.expectEqualStrings("iVBOR", inline_data.get("data").?.string);
+}
+
+test "gemini buildChatRequestBody with image_url special chars" {
+    const alloc = std.testing.allocator;
+    const cp = &[_]root.ContentPart{
+        .{ .image_url = .{ .url = "https://example.com/img?a=1&b=\"quote\"" } },
+    };
+    var msgs = [_]root.ChatMessage{
+        .{ .role = .user, .content = "", .content_parts = cp },
+    };
+    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs }, 0.7);
+    defer alloc.free(body);
+    // Must produce valid JSON despite special chars in URL
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const contents = parsed.value.object.get("contents").?.array;
+    const parts = contents.items[0].object.get("parts").?.array;
+    try std.testing.expectEqual(@as(usize, 1), parts.items.len);
+    const text = parts.items[0].object.get("text").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"quote\"") != null);
 }

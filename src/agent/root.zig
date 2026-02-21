@@ -17,6 +17,7 @@ const Tool = tools_mod.Tool;
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
 const multimodal = @import("../multimodal.zig");
+const platform = @import("../platform.zig");
 const observability = @import("../observability.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
@@ -317,7 +318,16 @@ pub const Agent = struct {
                     m[i] = msg.toChatMessage();
                 }
                 // Process [IMAGE:] markers into content_parts for multimodal support
-                break :blk try multimodal.prepareMessagesForProvider(arena, m);
+                // Allow reading from the platform temp dir (where Telegram photos are saved)
+                const tmp_dir = platform.getTempDir(arena) catch null;
+                const allowed: []const []const u8 = if (tmp_dir) |td| blk2: {
+                    const dirs = try arena.alloc([]const u8, 1);
+                    dirs[0] = td;
+                    break :blk2 dirs;
+                } else &.{};
+                break :blk try multimodal.prepareMessagesForProvider(arena, m, .{
+                    .allowed_dirs = allowed,
+                });
             };
 
             const timer_start = std.time.milliTimestamp();
@@ -778,13 +788,22 @@ pub const Agent = struct {
         };
     }
 
-    /// Build a flat ChatMessage slice from owned history.
+    /// Build a flat ChatMessage slice from owned history, with multimodal processing.
     fn buildMessageSlice(self: *Agent) ![]ChatMessage {
-        const messages = try self.allocator.alloc(ChatMessage, self.history.items.len);
+        var tmp_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer tmp_arena.deinit();
+        const arena = tmp_arena.allocator();
+
+        const raw = try arena.alloc(ChatMessage, self.history.items.len);
         for (self.history.items, 0..) |*msg, i| {
-            messages[i] = msg.toChatMessage();
+            raw[i] = msg.toChatMessage();
         }
-        return messages;
+        // Apply multimodal processing; fall back to raw messages on failure
+        const processed = multimodal.prepareMessagesForProvider(arena, raw, .{}) catch raw;
+        // Dupe onto self.allocator so the result outlives the tmp arena
+        const result = try self.allocator.alloc(ChatMessage, processed.len);
+        @memcpy(result, processed);
+        return result;
     }
 
     /// Free heap-allocated fields of a ChatResponse.

@@ -213,8 +213,17 @@ pub fn serializeMessageContent(buf: *std.ArrayListUnmanaged(u8), allocator: std.
                 },
                 .image_base64 => |img| {
                     // OpenAI accepts base64 images as data URIs in image_url
+                    // Build data URI with escaped media_type
                     try buf.appendSlice(allocator, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
-                    try buf.appendSlice(allocator, img.media_type);
+                    // media_type is from detectMimeType (e.g. "image/png") — safe,
+                    // but escape for defense-in-depth
+                    for (img.media_type) |c| {
+                        switch (c) {
+                            '"' => try buf.appendSlice(allocator, "\\\""),
+                            '\\' => try buf.appendSlice(allocator, "\\\\"),
+                            else => try buf.append(allocator, c),
+                        }
+                    }
                     try buf.appendSlice(allocator, ";base64,");
                     try buf.appendSlice(allocator, img.data);
                     try buf.appendSlice(allocator, "\"}}");

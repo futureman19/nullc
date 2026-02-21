@@ -456,8 +456,7 @@ pub const TelegramChannel = struct {
         var file_arg_buf: [1024]u8 = undefined;
         var file_fbs = std.io.fixedBufferStream(&file_arg_buf);
         if (std.mem.startsWith(u8, file_path, "http://") or
-            std.mem.startsWith(u8, file_path, "https://") or
-            std.mem.startsWith(u8, file_path, "data:"))
+            std.mem.startsWith(u8, file_path, "https://"))
         {
             try file_fbs.writer().print("{s}={s}", .{ kind.formField(), file_path });
         } else {
@@ -723,7 +722,7 @@ pub const TelegramChannel = struct {
                         if (last_photo == .object) {
                             const fid_val = last_photo.object.get("file_id") orelse break :blk_content null;
                             const fid = if (fid_val == .string) fid_val.string else break :blk_content null;
-                            if (downloadTelegramPhoto(allocator, self.bot_token, fid)) |local_path| {
+                            if (downloadTelegramPhoto(allocator, self.bot_token, fid, self.proxy)) |local_path| {
                                 var result: std.ArrayListUnmanaged(u8) = .empty;
                                 result.appendSlice(allocator, "[IMAGE:") catch {
                                     allocator.free(local_path);
@@ -1073,7 +1072,8 @@ pub const TypingIndicator = struct {
 
 /// Download a photo from Telegram by file_id. Returns the local temp file path (caller-owned).
 /// Calls getFile API, then downloads the binary, saves to temp dir.
-fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, file_id: []const u8) ?[]u8 {
+/// Uses the provided proxy settings for all HTTP requests.
+fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, file_id: []const u8, proxy: ?[]const u8) ?[]u8 {
     // 1. Call getFile to get file_path
     var url_buf: [512]u8 = undefined;
     var url_fbs = std.io.fixedBufferStream(&url_buf);
@@ -1082,18 +1082,30 @@ fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, fi
 
     var body_list: std.ArrayListUnmanaged(u8) = .empty;
     defer body_list.deinit(allocator);
-    body_list.appendSlice(allocator, "{\"file_id\":\"") catch return null;
-    body_list.appendSlice(allocator, file_id) catch return null;
-    body_list.appendSlice(allocator, "\"}") catch return null;
+    body_list.appendSlice(allocator, "{\"file_id\":") catch return null;
+    root.json_util.appendJsonString(&body_list, allocator, file_id) catch return null;
+    body_list.appendSlice(allocator, "}") catch return null;
 
-    const resp = root.http_util.curlPost(allocator, api_url, body_list.items, &.{}) catch return null;
+    const resp = root.http_util.curlPostWithProxy(allocator, api_url, body_list.items, &.{}, proxy, null) catch |err| {
+        log.warn("downloadTelegramPhoto: getFile API failed: {}", .{err});
+        return null;
+    };
     defer allocator.free(resp);
 
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch |err| {
+        log.warn("downloadTelegramPhoto: JSON parse failed: {}", .{err});
+        return null;
+    };
     defer parsed.deinit();
 
-    const result_obj = parsed.value.object.get("result") orelse return null;
-    const fp_val = result_obj.object.get("file_path") orelse return null;
+    const result_obj = parsed.value.object.get("result") orelse {
+        log.warn("downloadTelegramPhoto: no 'result' in response", .{});
+        return null;
+    };
+    const fp_val = result_obj.object.get("file_path") orelse {
+        log.warn("downloadTelegramPhoto: no 'file_path' in result", .{});
+        return null;
+    };
     const tg_file_path = if (fp_val == .string) fp_val.string else return null;
 
     // 2. Download the file
@@ -1102,7 +1114,10 @@ fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, fi
     dl_fbs.writer().print("https://api.telegram.org/file/bot{s}/{s}", .{ bot_token, tg_file_path }) catch return null;
     const dl_url = dl_fbs.getWritten();
 
-    const data = root.http_util.curlGet(allocator, dl_url, &.{}, "30") catch return null;
+    const data = root.http_util.curlGetWithProxy(allocator, dl_url, &.{}, "30", proxy) catch |err| {
+        log.warn("downloadTelegramPhoto: file download failed: {}", .{err});
+        return null;
+    };
     defer allocator.free(data);
 
     // 3. Determine file extension from the Telegram file_path
@@ -1111,18 +1126,26 @@ fn downloadTelegramPhoto(allocator: std.mem.Allocator, bot_token: []const u8, fi
     else
         ".jpg";
 
-    // 4. Save to temp file
+    // 4. Save to temp file — use sanitized file_id as filename (no hash collisions)
     const tmp_dir = platform.getTempDir(allocator) catch return null;
     defer allocator.free(tmp_dir);
     var path_buf: [512]u8 = undefined;
     var path_fbs = std.io.fixedBufferStream(&path_buf);
-    // Use file_id hash for unique name
-    const hash = std.hash.Fnv1a_32.hash(file_id);
-    path_fbs.writer().print("{s}/nullclaw_photo_{x}{s}", .{ tmp_dir, hash, ext }) catch return null;
+    // Sanitize file_id for filesystem safety (replace / and \ with _)
+    var name_buf: [256]u8 = undefined;
+    const safe_len = @min(file_id.len, 200);
+    @memcpy(name_buf[0..safe_len], file_id[0..safe_len]);
+    for (name_buf[0..safe_len]) |*c| {
+        if (c.* == '/' or c.* == '\\') c.* = '_';
+    }
+    path_fbs.writer().print("{s}/nullclaw_photo_{s}{s}", .{ tmp_dir, name_buf[0..safe_len], ext }) catch return null;
     const local_path = path_fbs.getWritten();
 
     // Write file
-    const file = std.fs.createFileAbsolute(local_path, .{}) catch return null;
+    const file = std.fs.createFileAbsolute(local_path, .{}) catch |err| {
+        log.warn("downloadTelegramPhoto: file create failed: {}", .{err});
+        return null;
+    };
     defer file.close();
     file.writeAll(data) catch return null;
 
@@ -1657,9 +1680,10 @@ test "telegram sendMediaMultipart URL detection for local file" {
         std.mem.startsWith(u8, path, "data:")));
 }
 
-test "telegram sendMediaMultipart URL detection for data URI" {
+test "telegram sendMediaMultipart data URI treated as local file" {
+    // data: URIs are NOT treated as URLs in sendMediaMultipart (would overflow the
+    // 1024-byte buffer and curl can't upload them). They are passed as local file @paths.
     const data_uri = "data:image/png;base64,iVBOR";
-    try std.testing.expect(std.mem.startsWith(u8, data_uri, "http://") or
-        std.mem.startsWith(u8, data_uri, "https://") or
-        std.mem.startsWith(u8, data_uri, "data:"));
+    try std.testing.expect(!(std.mem.startsWith(u8, data_uri, "http://") or
+        std.mem.startsWith(u8, data_uri, "https://")));
 }
