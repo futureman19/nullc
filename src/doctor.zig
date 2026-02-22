@@ -489,17 +489,21 @@ pub fn checkEnvironment(
     // git
     if (try checkCommandAvailable(allocator, "git")) |ver| {
         defer allocator.free(ver);
-        try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(allocator, "git: {s}", .{ver})));
-    } else {
-        try items.append(allocator, DiagItem.warn(cat, "git not found"));
+        if (std.mem.startsWith(u8, ver, "not found")) {
+            try items.append(allocator, DiagItem.warn(cat, try std.fmt.allocPrint(allocator, "git {s}", .{ver})));
+        } else {
+            try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(allocator, "git: {s}", .{ver})));
+        }
     }
 
     // curl
     if (try checkCommandAvailable(allocator, "curl")) |ver| {
         defer allocator.free(ver);
-        try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(allocator, "curl: {s}", .{ver})));
-    } else {
-        try items.append(allocator, DiagItem.warn(cat, "curl not found"));
+        if (std.mem.startsWith(u8, ver, "not found")) {
+            try items.append(allocator, DiagItem.warn(cat, try std.fmt.allocPrint(allocator, "curl {s}", .{ver})));
+        } else {
+            try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(allocator, "curl: {s}", .{ver})));
+        }
     }
 
     // $SHELL
@@ -527,8 +531,10 @@ fn checkCommandAvailable(allocator: std.mem.Allocator, cmd: []const u8) !?[]cons
     const result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ cmd, "--version" },
-        .max_output_bytes = 512,
-    }) catch return null;
+        .max_output_bytes = 1024,
+    }) catch |e| {
+        return try std.fmt.allocPrint(allocator, "not found (err: {s})", .{@errorName(e)});
+    };
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     switch (result.term) {
