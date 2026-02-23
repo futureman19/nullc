@@ -21,6 +21,7 @@ pub const HeartbeatConfig = config_types.HeartbeatConfig;
 pub const CronConfig = config_types.CronConfig;
 pub const TelegramConfig = config_types.TelegramConfig;
 pub const DiscordConfig = config_types.DiscordConfig;
+pub const SlackReceiveMode = config_types.SlackReceiveMode;
 pub const SlackConfig = config_types.SlackConfig;
 pub const WebhookConfig = config_types.WebhookConfig;
 pub const IMessageConfig = config_types.IMessageConfig;

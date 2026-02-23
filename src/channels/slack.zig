@@ -1,16 +1,27 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus_mod = @import("../bus.zig");
+const websocket = @import("../websocket.zig");
 
 const log = std.log.scoped(.slack);
 
-/// Slack channel — polls conversations.history for new messages, sends via chat.postMessage.
+const SocketFd = std.net.Stream.Handle;
+const invalid_socket: SocketFd = switch (builtin.os.tag) {
+    .windows => std.os.windows.ws2_32.INVALID_SOCKET,
+    else => -1,
+};
+
+/// Slack channel — socket/http event pipeline for inbound, chat.postMessage for outbound.
 pub const SlackChannel = struct {
     allocator: std.mem.Allocator,
     account_id: []const u8 = "default",
+    mode: config_types.SlackReceiveMode = .socket,
     bot_token: []const u8,
     app_token: ?[]const u8,
+    signing_secret: ?[]const u8 = null,
+    webhook_path: []const u8 = "/slack/events",
     channel_id: ?[]const u8,
     allow_from: []const []const u8,
     last_ts: []const u8,
@@ -20,10 +31,15 @@ pub const SlackChannel = struct {
     policy: root.ChannelPolicy = .{},
     bus: ?*bus_mod.Bus = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     poll_thread: ?std.Thread = null,
+    socket_thread: ?std.Thread = null,
+    ws_fd: std.atomic.Value(SocketFd) = std.atomic.Value(SocketFd).init(invalid_socket),
     bot_user_id: ?[]u8 = null,
 
     pub const API_BASE = "https://slack.com/api";
+    pub const DEFAULT_WEBHOOK_PATH = "/slack/events";
+    pub const RECONNECT_DELAY_NS: u64 = 5 * std.time.ns_per_s;
     pub const POLL_INTERVAL_SECS: u64 = 3;
 
     pub fn init(
@@ -54,6 +70,13 @@ pub const SlackChannel = struct {
         if (std.mem.eql(u8, raw, "open")) return .open;
         if (std.mem.eql(u8, raw, "allowlist")) return .allowlist;
         return .mention_only;
+    }
+
+    pub fn normalizeWebhookPath(raw: []const u8) []const u8 {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return DEFAULT_WEBHOOK_PATH;
+        if (trimmed[0] != '/') return DEFAULT_WEBHOOK_PATH;
+        return trimmed;
     }
 
     pub fn initWithPolicy(
@@ -90,6 +113,9 @@ pub const SlackChannel = struct {
             policy,
         );
         ch.account_id = cfg.account_id;
+        ch.mode = cfg.mode;
+        ch.signing_secret = cfg.signing_secret;
+        ch.webhook_path = normalizeWebhookPath(cfg.webhook_path);
         return ch;
     }
 
@@ -133,7 +159,11 @@ pub const SlackChannel = struct {
     }
 
     pub fn healthCheck(self: *SlackChannel) bool {
-        return self.running.load(.acquire) and self.poll_thread != null;
+        if (!self.running.load(.acquire)) return false;
+        return switch (self.mode) {
+            .http => true,
+            .socket => (self.connected.load(.acquire) and self.socket_thread != null) or self.poll_thread != null,
+        };
     }
 
     fn setLastTs(self: *SlackChannel, ts: []const u8) !void {
@@ -227,6 +257,9 @@ pub const SlackChannel = struct {
         const user_val = msg_obj.get("user") orelse return;
         if (user_val != .string or user_val.string.len == 0) return;
         const sender_id = user_val.string;
+        if (self.bot_user_id) |bot_uid| {
+            if (std.mem.eql(u8, sender_id, bot_uid)) return;
+        }
 
         const text_val = msg_obj.get("text") orelse return;
         if (text_val != .string) return;
@@ -353,6 +386,162 @@ pub const SlackChannel = struct {
         }
     }
 
+    fn componentAsSlice(component: std.Uri.Component) []const u8 {
+        return switch (component) {
+            .raw => |v| v,
+            .percent_encoded => |v| v,
+        };
+    }
+
+    fn parseSocketConnectParts(
+        socket_url: []const u8,
+        host_buf: []u8,
+        path_buf: []u8,
+    ) !struct { host: []const u8, port: u16, path: []const u8 } {
+        const uri = std.Uri.parse(socket_url) catch return error.SlackApiError;
+        if (!std.ascii.eqlIgnoreCase(uri.scheme, "wss")) return error.SlackApiError;
+
+        const host = uri.getHost(host_buf) catch return error.SlackApiError;
+        const port = uri.port orelse 443;
+        const raw_path = componentAsSlice(uri.path);
+        const query = if (uri.query) |q| componentAsSlice(q) else "";
+
+        var fbs = std.io.fixedBufferStream(path_buf);
+        const w = fbs.writer();
+        if (raw_path.len == 0) {
+            try w.writeByte('/');
+        } else {
+            if (raw_path[0] != '/') try w.writeByte('/');
+            try w.writeAll(raw_path);
+        }
+        if (query.len > 0) {
+            try w.writeByte('?');
+            try w.writeAll(query);
+        }
+        return .{
+            .host = host,
+            .port = port,
+            .path = fbs.getWritten(),
+        };
+    }
+
+    fn openSocketUrl(self: *SlackChannel) ![]u8 {
+        const app_token = self.app_token orelse return error.SlackAppTokenRequired;
+        const url = API_BASE ++ "/apps.connections.open";
+        const auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{app_token});
+        defer self.allocator.free(auth_header);
+        const headers = [_][]const u8{auth_header};
+        const resp = root.http_util.curlPost(self.allocator, url, "{}", &headers) catch return error.SlackApiError;
+        defer self.allocator.free(resp);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return error.SlackApiError;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.SlackApiError;
+        const ok_val = parsed.value.object.get("ok") orelse return error.SlackApiError;
+        if (ok_val != .bool or !ok_val.bool) return error.SlackApiError;
+        const ws_url = parsed.value.object.get("url") orelse return error.SlackApiError;
+        if (ws_url != .string or ws_url.string.len == 0) return error.SlackApiError;
+        return self.allocator.dupe(u8, ws_url.string);
+    }
+
+    fn ackSocketEnvelope(self: *SlackChannel, ws: *websocket.WsClient, envelope_id: []const u8) !void {
+        var buf: [512]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        const w = fbs.writer();
+        try w.writeAll("{\"envelope_id\":");
+        try root.appendJsonStringW(w, envelope_id);
+        try w.writeAll("}");
+        try ws.writeText(fbs.getWritten());
+        _ = self;
+    }
+
+    fn handleSocketPayload(self: *SlackChannel, ws: *websocket.WsClient, payload: []const u8) !void {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+
+        const msg_type = if (parsed.value.object.get("type")) |tv|
+            if (tv == .string) tv.string else ""
+        else
+            "";
+
+        if (std.mem.eql(u8, msg_type, "disconnect")) return error.ShouldReconnect;
+
+        if (parsed.value.object.get("envelope_id")) |env_val| {
+            if (env_val == .string and env_val.string.len > 0) {
+                self.ackSocketEnvelope(ws, env_val.string) catch |err| {
+                    log.warn("Slack socket ack failed: {}", .{err});
+                };
+            }
+        }
+
+        if (!std.mem.eql(u8, msg_type, "events_api")) return;
+
+        const payload_val = parsed.value.object.get("payload") orelse return;
+        if (payload_val != .object) return;
+        const event_val = payload_val.object.get("event") orelse return;
+        if (event_val != .object) return;
+
+        const event_type_val = event_val.object.get("type") orelse return;
+        if (event_type_val != .string) return;
+        const event_type = event_type_val.string;
+        if (!std.mem.eql(u8, event_type, "message") and !std.mem.eql(u8, event_type, "app_mention")) {
+            return;
+        }
+
+        const channel_val = event_val.object.get("channel") orelse return;
+        if (channel_val != .string or channel_val.string.len == 0) return;
+        try self.processHistoryMessage(event_val.object, channel_val.string);
+    }
+
+    fn runSocketOnce(self: *SlackChannel) !void {
+        const ws_url = try self.openSocketUrl();
+        defer self.allocator.free(ws_url);
+
+        var host_buf: [512]u8 = undefined;
+        var path_buf: [2048]u8 = undefined;
+        const parts = try parseSocketConnectParts(ws_url, &host_buf, &path_buf);
+        var ws = try websocket.WsClient.connect(self.allocator, parts.host, parts.port, parts.path, &.{});
+        defer {
+            self.connected.store(false, .release);
+            self.ws_fd.store(invalid_socket, .release);
+            ws.deinit();
+        }
+        self.ws_fd.store(ws.stream.handle, .release);
+        self.connected.store(true, .release);
+
+        while (self.running.load(.acquire)) {
+            const maybe_text = ws.readTextMessage() catch |err| switch (err) {
+                error.ConnectionClosed => break,
+                else => return err,
+            };
+            const text = maybe_text orelse break;
+            defer self.allocator.free(text);
+            self.handleSocketPayload(&ws, text) catch |err| {
+                if (err == error.ShouldReconnect) return err;
+                log.warn("Slack socket payload error: {}", .{err});
+            };
+        }
+    }
+
+    fn socketLoop(self: *SlackChannel) void {
+        while (self.running.load(.acquire)) {
+            self.runSocketOnce() catch |err| {
+                if (err != error.SlackAppTokenRequired) {
+                    log.warn("Slack socket cycle failed: {}", .{err});
+                }
+            };
+            if (!self.running.load(.acquire)) break;
+
+            var slept: u64 = 0;
+            while (slept < RECONNECT_DELAY_NS and self.running.load(.acquire)) {
+                std.Thread.sleep(100 * std.time.ns_per_ms);
+                slept += 100 * std.time.ns_per_ms;
+            }
+        }
+        self.connected.store(false, .release);
+    }
+
     // ── Channel vtable ──────────────────────────────────────────────
 
     /// Send a message to a Slack channel via chat.postMessage API.
@@ -394,22 +583,48 @@ pub const SlackChannel = struct {
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *SlackChannel = @ptrCast(@alignCast(ptr));
         if (self.running.load(.acquire)) return;
-        if (self.channel_id == null) return error.SlackChannelIdRequired;
 
         self.running.store(true, .release);
         errdefer self.running.store(false, .release);
+        self.connected.store(false, .release);
 
         // Best-effort bot identity fetch for mention-only policies.
         self.fetchBotUserId() catch |err| {
             log.warn("Slack auth.test failed: {}", .{err});
         };
 
-        self.poll_thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, pollLoop, .{self});
+        switch (self.mode) {
+            .socket => {
+                if (self.app_token == null) return error.SlackAppTokenRequired;
+                self.socket_thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, socketLoop, .{self});
+            },
+            .http => {
+                const secret = self.signing_secret orelse return error.SlackSigningSecretRequired;
+                if (std.mem.trim(u8, secret, " \t\r\n").len == 0) return error.SlackSigningSecretRequired;
+            },
+        }
     }
 
     fn vtableStop(ptr: *anyopaque) void {
         const self: *SlackChannel = @ptrCast(@alignCast(ptr));
         self.running.store(false, .release);
+        self.connected.store(false, .release);
+
+        const fd = self.ws_fd.load(.acquire);
+        if (fd != invalid_socket) {
+            if (comptime builtin.os.tag == .windows) {
+                _ = std.os.windows.ws2_32.closesocket(fd);
+            } else {
+                std.posix.close(fd);
+            }
+            self.ws_fd.store(invalid_socket, .release);
+        }
+
+        if (self.socket_thread) |t| {
+            t.join();
+            self.socket_thread = null;
+        }
+
         if (self.poll_thread) |t| {
             t.join();
             self.poll_thread = null;
@@ -643,8 +858,26 @@ test "slack channel init defaults" {
 test "slack initFromConfig maps pairing dm_policy to allowlist" {
     const cfg = config_types.SlackConfig{
         .account_id = "main",
+        .mode = .socket,
         .bot_token = "xoxb-test",
+        .app_token = "xapp-test",
         .dm_policy = "pairing",
+        .group_policy = "mention_only",
+        .allow_from = &.{"U123"},
+    };
+    const ch = SlackChannel.initFromConfig(std.testing.allocator, cfg);
+    try std.testing.expectEqual(root.DmPolicy.allowlist, ch.policy.dm);
+    try std.testing.expectEqual(config_types.SlackReceiveMode.socket, ch.mode);
+    try std.testing.expectEqualStrings(SlackChannel.DEFAULT_WEBHOOK_PATH, ch.webhook_path);
+}
+
+test "slack initFromConfig unknown dm_policy fails closed to allowlist" {
+    const cfg = config_types.SlackConfig{
+        .account_id = "main",
+        .mode = .socket,
+        .bot_token = "xoxb-test",
+        .app_token = "xapp-test",
+        .dm_policy = "something-unknown",
         .group_policy = "mention_only",
         .allow_from = &.{"U123"},
     };
@@ -652,16 +885,18 @@ test "slack initFromConfig maps pairing dm_policy to allowlist" {
     try std.testing.expectEqual(root.DmPolicy.allowlist, ch.policy.dm);
 }
 
-test "slack initFromConfig unknown dm_policy fails closed to allowlist" {
+test "slack initFromConfig stores http mode signing secret and webhook path" {
     const cfg = config_types.SlackConfig{
-        .account_id = "main",
+        .account_id = "sl-http",
+        .mode = .http,
         .bot_token = "xoxb-test",
-        .dm_policy = "something-unknown",
-        .group_policy = "mention_only",
-        .allow_from = &.{"U123"},
+        .signing_secret = "sign-secret",
+        .webhook_path = "/slack/custom-events",
     };
     const ch = SlackChannel.initFromConfig(std.testing.allocator, cfg);
-    try std.testing.expectEqual(root.DmPolicy.allowlist, ch.policy.dm);
+    try std.testing.expectEqual(config_types.SlackReceiveMode.http, ch.mode);
+    try std.testing.expectEqualStrings("sign-secret", ch.signing_secret.?);
+    try std.testing.expectEqualStrings("/slack/custom-events", ch.webhook_path);
 }
 
 test "slack channel name" {
@@ -1057,4 +1292,23 @@ test "initWithPolicy sets policy correctly" {
     try std.testing.expectEqualStrings("tok", ch.bot_token);
     try std.testing.expectEqualStrings("xapp-test", ch.app_token.?);
     try std.testing.expectEqualStrings("C999", ch.channel_id.?);
+}
+
+test "normalizeWebhookPath falls back for invalid values" {
+    try std.testing.expectEqualStrings(SlackChannel.DEFAULT_WEBHOOK_PATH, SlackChannel.normalizeWebhookPath(""));
+    try std.testing.expectEqualStrings(SlackChannel.DEFAULT_WEBHOOK_PATH, SlackChannel.normalizeWebhookPath("slack/events"));
+    try std.testing.expectEqualStrings("/slack/events", SlackChannel.normalizeWebhookPath("/slack/events"));
+}
+
+test "parseSocketConnectParts extracts host port and path" {
+    var host_buf: [128]u8 = undefined;
+    var path_buf: [512]u8 = undefined;
+    const parts = try SlackChannel.parseSocketConnectParts(
+        "wss://wss-primary.slack.com/link/?ticket=abc123",
+        &host_buf,
+        &path_buf,
+    );
+    try std.testing.expectEqualStrings("wss-primary.slack.com", parts.host);
+    try std.testing.expectEqual(@as(u16, 443), parts.port);
+    try std.testing.expectEqualStrings("/link/?ticket=abc123", parts.path);
 }

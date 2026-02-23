@@ -164,10 +164,18 @@ pub const DiscordConfig = struct {
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
 };
 
+pub const SlackReceiveMode = enum {
+    socket,
+    http,
+};
+
 pub const SlackConfig = struct {
     account_id: []const u8 = "default",
+    mode: SlackReceiveMode = .socket,
     bot_token: []const u8,
     app_token: ?[]const u8 = null,
+    signing_secret: ?[]const u8 = null,
+    webhook_path: []const u8 = "/slack/events",
     channel_id: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
     dm_policy: []const u8 = "allowlist",

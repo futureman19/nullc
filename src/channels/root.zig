@@ -5,7 +5,7 @@
 //!   - CLI (built-in stdin/stdout)
 //!   - Telegram (long-polling)
 //!   - Discord (WebSocket gateway)
-//!   - Slack (polling conversations.history)
+//!   - Slack (socket/http event pipeline)
 //!   - WhatsApp (webhook-based)
 //!   - Matrix (long-polling /sync)
 //!   - Mattermost (WebSocket + REST API)

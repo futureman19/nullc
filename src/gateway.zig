@@ -6,7 +6,7 @@
 //!   - Body size limits (64KB max)
 //!   - Request timeouts (30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram, /line, /lark
+//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram, /line, /lark, /slack/events
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
@@ -700,6 +700,139 @@ fn selectLarkConfig(
     return &cfg.channels.lark[0];
 }
 
+fn webhookBasePath(target: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, target, '?')) |qi| return target[0..qi];
+    return target;
+}
+
+fn normalizeSlackWebhookPath(path: []const u8) []const u8 {
+    return channels.slack.SlackChannel.normalizeWebhookPath(path);
+}
+
+fn hasSlackHttpEndpoint(cfg_opt: ?*const Config, base_path: []const u8) bool {
+    const cfg = cfg_opt orelse return std.mem.eql(u8, base_path, channels.slack.SlackChannel.DEFAULT_WEBHOOK_PATH);
+    for (cfg.channels.slack) |slack_cfg| {
+        if (slack_cfg.mode != .http) continue;
+        if (std.mem.eql(u8, normalizeSlackWebhookPath(slack_cfg.webhook_path), base_path)) return true;
+    }
+    return false;
+}
+
+fn verifySlackSignature(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    timestamp_header: []const u8,
+    signature_header: []const u8,
+    signing_secret: []const u8,
+) bool {
+    if (signing_secret.len == 0) return false;
+    const ts_trimmed = std.mem.trim(u8, timestamp_header, " \t\r\n");
+    const sig_trimmed = std.mem.trim(u8, signature_header, " \t\r\n");
+    if (!std.mem.startsWith(u8, sig_trimmed, "v0=")) return false;
+
+    const provided_hex = sig_trimmed["v0=".len..];
+    if (provided_hex.len != 64) return false;
+
+    const ts = std.fmt.parseInt(i64, ts_trimmed, 10) catch return false;
+    const now = std.time.timestamp();
+    const delta = if (now >= ts) now - ts else ts - now;
+    if (delta > 300) return false; // 5-minute replay window
+
+    var base_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer base_buf.deinit(allocator);
+    const bw = base_buf.writer(allocator);
+    bw.print("v0:{s}:", .{ts_trimmed}) catch return false;
+    bw.writeAll(body) catch return false;
+
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac: [32]u8 = undefined;
+    HmacSha256.create(&mac, base_buf.items, signing_secret);
+
+    var provided: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        const hi = hexVal(provided_hex[i * 2]) orelse return false;
+        const lo = hexVal(provided_hex[i * 2 + 1]) orelse return false;
+        provided[i] = (hi << 4) | lo;
+    }
+    return constantTimeEql(&mac, &provided);
+}
+
+fn findSlackConfigForRequest(
+    allocator: std.mem.Allocator,
+    cfg_opt: ?*const Config,
+    target: []const u8,
+    body: []const u8,
+    timestamp_header: ?[]const u8,
+    signature_header: ?[]const u8,
+) ?*const config_types.SlackConfig {
+    const cfg = cfg_opt orelse return null;
+    if (cfg.channels.slack.len == 0) return null;
+
+    const base_path = webhookBasePath(target);
+    for (cfg.channels.slack) |*slack_cfg| {
+        if (slack_cfg.mode != .http) continue;
+        if (!std.mem.eql(u8, normalizeSlackWebhookPath(slack_cfg.webhook_path), base_path)) continue;
+
+        const secret = slack_cfg.signing_secret orelse continue;
+        if (timestamp_header == null or signature_header == null) continue;
+        if (verifySlackSignature(
+            allocator,
+            body,
+            timestamp_header.?,
+            signature_header.?,
+            secret,
+        )) return slack_cfg;
+    }
+    return null;
+}
+
+fn slackSessionKey(
+    buf: []u8,
+    account_id: []const u8,
+    sender_id: []const u8,
+    channel_id: []const u8,
+    is_dm: bool,
+) []const u8 {
+    if (is_dm) {
+        return std.fmt.bufPrint(buf, "slack:{s}:direct:{s}", .{ account_id, sender_id }) catch "slack:unknown";
+    }
+    return std.fmt.bufPrint(buf, "slack:{s}:channel:{s}", .{ account_id, channel_id }) catch "slack:unknown";
+}
+
+fn slackSessionKeyRouted(
+    allocator: std.mem.Allocator,
+    fallback_buf: []u8,
+    account_id: []const u8,
+    sender_id: []const u8,
+    channel_id: []const u8,
+    is_dm: bool,
+    cfg_opt: ?*const Config,
+) []const u8 {
+    const fallback = slackSessionKey(fallback_buf, account_id, sender_id, channel_id, is_dm);
+    return resolveRouteSessionKey(
+        allocator,
+        cfg_opt,
+        "slack",
+        account_id,
+        .{
+            .kind = if (is_dm) .direct else .channel,
+            .id = if (is_dm) sender_id else channel_id,
+        },
+        fallback,
+    );
+}
+
+fn slackEnvelopeBotUserId(payload_root: std.json.ObjectMap) ?[]const u8 {
+    const authz = payload_root.get("authorizations") orelse return null;
+    if (authz != .array or authz.array.items.len == 0) return null;
+    const first = authz.array.items[0];
+    if (first != .object) return null;
+    const uid_val = first.object.get("user_id") orelse return null;
+    if (uid_val != .string or uid_val.string.len == 0) return null;
+    return uid_val.string;
+}
+
 fn whatsappSessionKey(buf: []u8, body: []const u8) []const u8 {
     const sender = jsonStringField(body, "from") orelse "unknown";
     const group_id = jsonStringField(body, "group_jid") orelse jsonStringField(body, "group_id");
@@ -1112,6 +1245,7 @@ const WebhookRouteDescriptor = struct {
 const webhook_route_descriptors = [_]WebhookRouteDescriptor{
     .{ .path = "/telegram", .handler = handleTelegramWebhookRoute },
     .{ .path = "/whatsapp", .handler = handleWhatsAppWebhookRoute },
+    .{ .path = "/slack/events", .handler = handleSlackWebhookRoute },
     .{ .path = "/line", .handler = handleLineWebhookRoute },
     .{ .path = "/lark", .handler = handleLarkWebhookRoute },
 };
@@ -1396,6 +1530,192 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
     }
 }
 
+fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "slack")) {
+        ctx.response_status = "429 Too Many Requests";
+        ctx.response_body = "{\"error\":\"rate limited\"}";
+        return;
+    }
+
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_body = "{\"status\":\"received\"}";
+        return;
+    };
+
+    const ts_header = extractHeader(ctx.raw_request, "X-Slack-Request-Timestamp");
+    const sig_header = extractHeader(ctx.raw_request, "X-Slack-Signature");
+
+    const slack_cfg = findSlackConfigForRequest(ctx.req_allocator, ctx.config_opt, ctx.target, body, ts_header, sig_header) orelse {
+        if (hasSlackHttpEndpoint(ctx.config_opt, webhookBasePath(ctx.target))) {
+            ctx.response_status = "403 Forbidden";
+            ctx.response_body = "{\"error\":\"invalid signature\"}";
+            return;
+        }
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"slack account not configured\"}";
+        return;
+    };
+
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, body, .{}) catch {
+        ctx.response_body = "{\"status\":\"parse_error\"}";
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    }
+
+    const payload_type = if (parsed.value.object.get("type")) |tv|
+        if (tv == .string) tv.string else ""
+    else
+        "";
+
+    if (std.mem.eql(u8, payload_type, "url_verification")) {
+        const challenge = jsonStringField(body, "challenge") orelse "";
+        if (challenge.len == 0) {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        }
+        const challenge_resp = std.fmt.allocPrint(ctx.req_allocator, "{{\"challenge\":\"{s}\"}}", .{challenge}) catch {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        };
+        ctx.response_body = challenge_resp;
+        return;
+    }
+
+    if (!std.mem.eql(u8, payload_type, "event_callback")) {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    }
+
+    const event_val = parsed.value.object.get("event") orelse {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    };
+    if (event_val != .object) {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    }
+    const event_obj = event_val.object;
+
+    const event_type_val = event_obj.get("type") orelse {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    };
+    if (event_type_val != .string) {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    }
+    const event_type = event_type_val.string;
+    if (!std.mem.eql(u8, event_type, "message") and !std.mem.eql(u8, event_type, "app_mention")) {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    }
+
+    if (event_obj.get("subtype")) |subtype_val| {
+        if (subtype_val == .string and subtype_val.string.len > 0) {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        }
+    }
+
+    const user_val = event_obj.get("user") orelse {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    };
+    if (user_val != .string or user_val.string.len == 0) {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    }
+    const sender_id = user_val.string;
+
+    const text_val = event_obj.get("text") orelse {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    };
+    if (text_val != .string) {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    }
+    const text = std.mem.trim(u8, text_val.string, " \t\r\n");
+    if (text.len == 0) {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    }
+
+    const channel_val = event_obj.get("channel") orelse {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    };
+    if (channel_val != .string or channel_val.string.len == 0) {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    }
+    const channel_id = channel_val.string;
+    const is_dm = blk: {
+        if (event_obj.get("channel_type")) |ct| {
+            if (ct == .string and std.mem.eql(u8, ct.string, "im")) break :blk true;
+        }
+        break :blk channel_id.len > 0 and channel_id[0] == 'D';
+    };
+
+    var policy_channel = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
+    const envelope_bot_user_id = slackEnvelopeBotUserId(parsed.value.object);
+    var allowed = policy_channel.shouldHandle(sender_id, is_dm, text, envelope_bot_user_id);
+    if (!allowed and std.mem.eql(u8, event_type, "app_mention")) {
+        allowed = channels.checkPolicy(policy_channel.policy, sender_id, is_dm, true);
+    }
+    if (!allowed) {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    }
+
+    var key_buf: [256]u8 = undefined;
+    const sk = slackSessionKeyRouted(
+        ctx.req_allocator,
+        &key_buf,
+        slack_cfg.account_id,
+        sender_id,
+        channel_id,
+        is_dm,
+        ctx.config_opt,
+    );
+
+    if (ctx.state.event_bus) |eb| {
+        var meta_buf: [384]u8 = undefined;
+        const peer_kind = if (is_dm) "direct" else "channel";
+        const peer_id = if (is_dm) sender_id else channel_id;
+        const metadata = std.fmt.bufPrint(
+            &meta_buf,
+            "{{\"account_id\":\"{s}\",\"is_dm\":{s},\"channel_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\"}}",
+            .{
+                slack_cfg.account_id,
+                if (is_dm) "true" else "false",
+                channel_id,
+                peer_kind,
+                peer_id,
+            },
+        ) catch null;
+        _ = publishToBus(eb, ctx.state.allocator, "slack", sender_id, channel_id, text, sk, metadata);
+    } else if (ctx.session_mgr_opt) |sm| {
+        const reply: ?[]const u8 = sm.processMessage(sk, text) catch null;
+        if (reply) |r| {
+            defer ctx.root_allocator.free(r);
+            var outbound_ch = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
+            outbound_ch.sendMessage(channel_id, r) catch {};
+        }
+    }
+
+    ctx.response_body = "{\"status\":\"ok\"}";
+}
+
 fn linePeerMetadata(evt: channels.line.LineEvent, peer_buf: []u8) struct {
     kind: []const u8,
     id: []const u8,
@@ -1621,7 +1941,7 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
 }
 
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /line, POST /lark
+/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark
 /// If config_ptr is null, loads config internally (for backward compatibility).
 pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr: ?*const Config, event_bus: ?*bus_mod.Bus) !void {
     health.markComponentOk("gateway");
@@ -1802,6 +2122,20 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 .session_mgr_opt = if (session_mgr_opt) |*sm| sm else null,
             };
             desc.handler(&webhook_ctx);
+            response_status = webhook_ctx.response_status;
+            response_body = webhook_ctx.response_body;
+        } else if (hasSlackHttpEndpoint(config_opt, base_path)) {
+            var webhook_ctx = WebhookHandlerContext{
+                .root_allocator = allocator,
+                .req_allocator = req_allocator,
+                .raw_request = raw,
+                .method = method_str,
+                .target = target,
+                .config_opt = config_opt,
+                .state = &state,
+                .session_mgr_opt = if (session_mgr_opt) |*sm| sm else null,
+            };
+            handleSlackWebhookRoute(&webhook_ctx);
             response_status = webhook_ctx.response_status;
             response_body = webhook_ctx.response_body;
         } else if (control_route_map.get(base_path)) |route| switch (route) {
@@ -2004,6 +2338,7 @@ test "gateway module compiles" {
 test "findWebhookRouteDescriptor resolves known webhook paths" {
     try std.testing.expect(findWebhookRouteDescriptor("/telegram") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/whatsapp") != null);
+    try std.testing.expect(findWebhookRouteDescriptor("/slack/events") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/line") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/lark") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/health") == null);
@@ -3084,6 +3419,149 @@ test "verifyWhatsappSignature uppercase hex accepted" {
     @memcpy(header_buf[0..7], "sha256=");
     @memcpy(header_buf[7..71], &hex_buf);
     try std.testing.expect(verifyWhatsappSignature(body, &header_buf, secret));
+}
+
+test "verifySlackSignature accepts valid signature" {
+    const body = "{\"type\":\"event_callback\"}";
+    const secret = "slack_signing_secret";
+
+    var ts_buf: [32]u8 = undefined;
+    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch unreachable;
+
+    var signed: std.ArrayListUnmanaged(u8) = .empty;
+    defer signed.deinit(std.testing.allocator);
+    const sw = signed.writer(std.testing.allocator);
+    try sw.print("v0:{s}:", .{ts});
+    try sw.writeAll(body);
+
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac, signed.items, secret);
+
+    var sig_buf: [67]u8 = undefined; // "v0=" + 64 hex
+    @memcpy(sig_buf[0..3], "v0=");
+    for (0..32) |i| {
+        const byte = mac[i];
+        sig_buf[3 + i * 2] = "0123456789abcdef"[byte >> 4];
+        sig_buf[3 + i * 2 + 1] = "0123456789abcdef"[byte & 0x0f];
+    }
+
+    try std.testing.expect(verifySlackSignature(std.testing.allocator, body, ts, &sig_buf, secret));
+}
+
+test "verifySlackSignature rejects stale timestamp" {
+    const body = "{\"type\":\"event_callback\"}";
+    const secret = "slack_signing_secret";
+
+    var ts_buf: [32]u8 = undefined;
+    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp() - 900}) catch unreachable;
+
+    var signed: std.ArrayListUnmanaged(u8) = .empty;
+    defer signed.deinit(std.testing.allocator);
+    const sw = signed.writer(std.testing.allocator);
+    try sw.print("v0:{s}:", .{ts});
+    try sw.writeAll(body);
+
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac, signed.items, secret);
+
+    var sig_buf: [67]u8 = undefined;
+    @memcpy(sig_buf[0..3], "v0=");
+    for (0..32) |i| {
+        const byte = mac[i];
+        sig_buf[3 + i * 2] = "0123456789abcdef"[byte >> 4];
+        sig_buf[3 + i * 2 + 1] = "0123456789abcdef"[byte & 0x0f];
+    }
+
+    try std.testing.expect(!verifySlackSignature(std.testing.allocator, body, ts, &sig_buf, secret));
+}
+
+test "hasSlackHttpEndpoint respects mode and webhook_path" {
+    const slack_accounts = [_]config_types.SlackConfig{
+        .{
+            .account_id = "sl-http",
+            .mode = .http,
+            .bot_token = "xoxb-http",
+            .signing_secret = "sec-http",
+            .webhook_path = "/slack/custom",
+        },
+        .{
+            .account_id = "sl-socket",
+            .mode = .socket,
+            .bot_token = "xoxb-socket",
+            .app_token = "xapp-socket",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .slack = &slack_accounts,
+        },
+    };
+
+    try std.testing.expect(hasSlackHttpEndpoint(&cfg, "/slack/custom"));
+    try std.testing.expect(!hasSlackHttpEndpoint(&cfg, "/slack/events"));
+    try std.testing.expect(!hasSlackHttpEndpoint(&cfg, "/line"));
+}
+
+test "findSlackConfigForRequest selects account by verified signature" {
+    const body = "{\"type\":\"event_callback\",\"event\":{\"type\":\"message\",\"channel\":\"C1\",\"user\":\"U1\",\"text\":\"hi\"}}";
+    const ts_val = std.time.timestamp();
+    var ts_buf: [32]u8 = undefined;
+    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{ts_val}) catch unreachable;
+
+    const secret_a = "slack_secret_a";
+    const secret_b = "slack_secret_b";
+
+    var signed: std.ArrayListUnmanaged(u8) = .empty;
+    defer signed.deinit(std.testing.allocator);
+    const sw = signed.writer(std.testing.allocator);
+    try sw.print("v0:{s}:", .{ts});
+    try sw.writeAll(body);
+
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac_b: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac_b, signed.items, secret_b);
+
+    var sig_buf: [67]u8 = undefined;
+    @memcpy(sig_buf[0..3], "v0=");
+    for (0..32) |i| {
+        const byte = mac_b[i];
+        sig_buf[3 + i * 2] = "0123456789abcdef"[byte >> 4];
+        sig_buf[3 + i * 2 + 1] = "0123456789abcdef"[byte & 0x0f];
+    }
+
+    const slack_accounts = [_]config_types.SlackConfig{
+        .{
+            .account_id = "a",
+            .mode = .http,
+            .bot_token = "xoxb-a",
+            .signing_secret = secret_a,
+            .webhook_path = "/slack/events",
+        },
+        .{
+            .account_id = "b",
+            .mode = .http,
+            .bot_token = "xoxb-b",
+            .signing_secret = secret_b,
+            .webhook_path = "/slack/events",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .slack = &slack_accounts,
+        },
+    };
+
+    const selected = findSlackConfigForRequest(std.testing.allocator, &cfg, "/slack/events", body, ts, &sig_buf);
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("b", selected.?.account_id);
 }
 
 test "GatewayState init has empty whatsapp_app_secret" {
