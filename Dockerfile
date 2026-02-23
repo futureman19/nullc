@@ -12,7 +12,7 @@ COPY src/ src/
 RUN zig build -Doptimize=ReleaseSmall
 
 # ── Stage 2: Config Prep ─────────────────────────────────────
-FROM busybox:1.37 AS permissions
+FROM busybox:1.37 AS config
 
 RUN mkdir -p /nullclaw-data/.nullclaw /nullclaw-data/workspace
 
@@ -30,22 +30,19 @@ RUN cat > /nullclaw-data/.nullclaw/config.json << 'EOF'
 }
 EOF
 
-RUN chown -R 65534:65534 /nullclaw-data
-
 # ── Stage 3: Production Runtime (Alpine/musl) ────────────────
 FROM alpine:3.23 AS release
 
 RUN apk add --no-cache ca-certificates tzdata
 
 COPY --from=builder /app/zig-out/bin/nullclaw /usr/local/bin/nullclaw
-COPY --from=permissions /nullclaw-data /nullclaw-data
+COPY --from=config /nullclaw-data /nullclaw-data
 
 ENV NULLCLAW_WORKSPACE=/nullclaw-data/workspace
 ENV HOME=/nullclaw-data
 ENV NULLCLAW_GATEWAY_PORT=3000
 
 WORKDIR /nullclaw-data
-USER 65534:65534
 EXPOSE 3000
 ENTRYPOINT ["nullclaw"]
 CMD ["gateway", "--port", "3000", "--host", "[::]"]
