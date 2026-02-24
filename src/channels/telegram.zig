@@ -163,6 +163,25 @@ fn nextPendingMediaDeadline(group_ids: []const ?[]const u8, received_at: []const
     return if (seen) next_deadline else null;
 }
 
+fn sweepTempMediaFilesInDir(dir_path: []const u8, now_secs: i64, ttl_secs: i64) void {
+    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, "nullclaw_doc_") and
+            !std.mem.startsWith(u8, entry.name, "nullclaw_photo_"))
+            continue;
+
+        const stat = dir.statFile(entry.name) catch continue;
+        const mtime_secs: i64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
+        if ((now_secs - mtime_secs) < ttl_secs) continue;
+
+        dir.deleteFile(entry.name) catch continue;
+    }
+}
+
 /// Parse attachment markers from LLM response text.
 /// Scans for [IMAGE:...], [DOCUMENT:...], [VIDEO:...], [AUDIO:...], [VOICE:...] markers.
 /// Returns extracted attachments and the remaining text with markers removed.
@@ -754,24 +773,7 @@ pub const TelegramChannel = struct {
     fn sweepTempMediaFiles(self: *TelegramChannel) void {
         const tmp_dir = platform.getTempDir(self.allocator) catch return;
         defer self.allocator.free(tmp_dir);
-
-        var dir = std.fs.openDirAbsolute(tmp_dir, .{ .iterate = true }) catch return;
-        defer dir.close();
-
-        const now = std.time.timestamp();
-        var iter = dir.iterate();
-        while (iter.next() catch null) |entry| {
-            if (entry.kind != .file) continue;
-            if (!std.mem.startsWith(u8, entry.name, "nullclaw_doc_") and
-                !std.mem.startsWith(u8, entry.name, "nullclaw_photo_"))
-                continue;
-
-            const stat = dir.statFile(entry.name) catch continue;
-            const mtime_secs: i64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
-            if ((now - mtime_secs) < TEMP_MEDIA_TTL_SECS) continue;
-
-            dir.deleteFile(entry.name) catch continue;
-        }
+        sweepTempMediaFilesInDir(tmp_dir, std.time.timestamp(), TEMP_MEDIA_TTL_SECS);
     }
 
     fn flushMaturedPendingMediaGroups(
@@ -2745,4 +2747,49 @@ test "telegram processUpdate falls back to caption when text is absent" {
 
     try std.testing.expectEqual(@as(usize, 1), messages.items.len);
     try std.testing.expectEqualStrings("caption-only fallback", messages.items[0].content);
+}
+
+test "telegram nextPendingMediaDeadline returns earliest group deadline" {
+    const group_ids = [_]?[]const u8{
+        "group-a",
+        "group-a",
+        "group-b",
+        null,
+        "group-b",
+    };
+    const received_at = [_]u64{
+        10,
+        12,
+        5,
+        100,
+        7,
+    };
+
+    const deadline = nextPendingMediaDeadline(group_ids[0..], received_at[0..]);
+    try std.testing.expect(deadline != null);
+    try std.testing.expectEqual(@as(u64, 10), deadline.?); // group-b latest=7 => 7+3
+}
+
+test "telegram sweepTempMediaFilesInDir removes only stale nullclaw temp media files" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "nullclaw_doc_old.txt", .data = "doc" });
+    try tmp_dir.dir.writeFile(.{ .sub_path = "nullclaw_photo_old.jpg", .data = "photo" });
+    try tmp_dir.dir.writeFile(.{ .sub_path = "keep.txt", .data = "keep" });
+
+    const abs_tmp = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(abs_tmp);
+
+    // TTL < 0 forces matched temp files to be treated as stale for test determinism.
+    sweepTempMediaFilesInDir(abs_tmp, std.time.timestamp(), -1);
+
+    const keep_stat = try tmp_dir.dir.statFile("keep.txt");
+    try std.testing.expect(keep_stat.size > 0);
+
+    const doc_stat = tmp_dir.dir.statFile("nullclaw_doc_old.txt");
+    try std.testing.expectError(error.FileNotFound, doc_stat);
+
+    const photo_stat = tmp_dir.dir.statFile("nullclaw_photo_old.jpg");
+    try std.testing.expectError(error.FileNotFound, photo_stat);
 }
