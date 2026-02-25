@@ -502,6 +502,7 @@ pub const SignalChannel = struct {
 
         var remaining: std.ArrayListUnmanaged(u8) = .empty;
         errdefer remaining.deinit(allocator);
+        var removed_any_marker = false;
 
         var cursor: usize = 0;
         while (cursor < text.len) {
@@ -524,11 +525,21 @@ pub const SignalChannel = struct {
                 const path_owned = try allocator.dupe(u8, path);
                 errdefer allocator.free(path_owned);
                 try paths_list.append(allocator, path_owned);
+                removed_any_marker = true;
                 cursor = close_pos + 1;
             } else {
                 try remaining.appendSlice(allocator, text[open_pos .. close_pos + 1]);
                 cursor = close_pos + 1;
             }
+        }
+
+        if (!removed_any_marker) {
+            const remaining_owned = try allocator.dupe(u8, text);
+            remaining.deinit(allocator);
+            return .{
+                .paths = try paths_list.toOwnedSlice(allocator),
+                .remaining = remaining_owned,
+            };
         }
 
         const trimmed = std.mem.trim(u8, remaining.items, " \t\n\r");
@@ -575,6 +586,7 @@ pub const SignalChannel = struct {
         // Add explicitly passed media first (convert to absolute paths).
         for (media) |m| {
             const abs_path = try resolveAttachmentPath(self.allocator, m);
+            errdefer self.allocator.free(abs_path);
             try all_media.append(self.allocator, abs_path);
         }
 
@@ -589,6 +601,7 @@ pub const SignalChannel = struct {
                 }
             }
             if (!found) {
+                errdefer self.allocator.free(abs_path);
                 try all_media.append(self.allocator, abs_path);
             } else {
                 self.allocator.free(abs_path);
@@ -1658,6 +1671,32 @@ test "parse image markers extracts paths and strips markers from text" {
     try std.testing.expectEqualStrings("/tmp/a.png", parsed.paths[0]);
     try std.testing.expectEqualStrings("/tmp/b.jpg", parsed.paths[1]);
     try std.testing.expectEqualStrings("Look and now", parsed.remaining);
+}
+
+test "parse image markers preserves text when there are no markers" {
+    const raw = "  keep leading and trailing whitespace \n";
+    const parsed = try SignalChannel.parseImageMarkers(std.testing.allocator, raw);
+    defer {
+        for (parsed.paths) |p| std.testing.allocator.free(p);
+        std.testing.allocator.free(parsed.paths);
+        std.testing.allocator.free(parsed.remaining);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), parsed.paths.len);
+    try std.testing.expectEqualStrings(raw, parsed.remaining);
+}
+
+test "parse image markers preserves text for malformed marker" {
+    const raw = "prefix [IMAGE:] suffix";
+    const parsed = try SignalChannel.parseImageMarkers(std.testing.allocator, raw);
+    defer {
+        for (parsed.paths) |p| std.testing.allocator.free(p);
+        std.testing.allocator.free(parsed.paths);
+        std.testing.allocator.free(parsed.remaining);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), parsed.paths.len);
+    try std.testing.expectEqualStrings(raw, parsed.remaining);
 }
 
 test "prepare outgoing content merges media and deduplicates paths" {
