@@ -16,6 +16,8 @@ const Config = config_mod.Config;
 const channel_catalog = @import("channel_catalog.zig");
 const memory_root = @import("memory/root.zig");
 const http_util = @import("http_util.zig");
+const json_util = @import("json_util.zig");
+const util = @import("util.zig");
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -31,6 +33,22 @@ const BANNER =
     \\  The smallest AI assistant. Zig-powered.
     \\
 ;
+
+const WORKSPACE_STATE_DIR = ".nullclaw";
+const WORKSPACE_STATE_FILE = "workspace-state.json";
+const WORKSPACE_STATE_VERSION: i64 = 1;
+
+const WorkspaceOnboardingState = struct {
+    version: i64 = WORKSPACE_STATE_VERSION,
+    bootstrap_seeded_at: ?[]const u8 = null,
+    onboarding_completed_at: ?[]const u8 = null,
+
+    fn deinit(self: *WorkspaceOnboardingState, allocator: std.mem.Allocator) void {
+        if (self.bootstrap_seeded_at) |ts| allocator.free(ts);
+        if (self.onboarding_completed_at) |ts| allocator.free(ts);
+        self.* = .{};
+    }
+};
 
 // ── Project context ──────────────────────────────────────────────
 
@@ -1535,8 +1553,9 @@ pub fn scaffoldWorkspace(allocator: std.mem.Allocator, workspace_dir: []const u8
     // HEARTBEAT.md (periodic tasks — loaded by prompt.zig)
     try writeIfMissing(allocator, workspace_dir, "HEARTBEAT.md", heartbeatTemplate());
 
-    // BOOTSTRAP.md (startup instructions — loaded by prompt.zig)
-    try writeIfMissing(allocator, workspace_dir, "BOOTSTRAP.md", bootstrapTemplate());
+    // BOOTSTRAP.md lifecycle matches OpenClaw semantics:
+    // one-shot onboarding instructions with persisted state marker.
+    try ensureBootstrapLifecycle(allocator, workspace_dir, identity_tmpl, user_tmpl);
 
     // Ensure memory/ subdirectory
     const mem_dir = try std.fmt.allocPrint(allocator, "{s}/memory", .{workspace_dir});
@@ -1560,6 +1579,225 @@ fn writeIfMissing(allocator: std.mem.Allocator, dir: []const u8, filename: []con
     const file = std.fs.createFileAbsolute(path, .{}) catch return;
     defer file.close();
     file.writeAll(content) catch {};
+}
+
+fn ensureBootstrapLifecycle(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    identity_template: []const u8,
+    user_template: []const u8,
+) !void {
+    const bootstrap_path = try std.fmt.allocPrint(allocator, "{s}/BOOTSTRAP.md", .{workspace_dir});
+    defer allocator.free(bootstrap_path);
+
+    var state = try readWorkspaceOnboardingState(allocator, workspace_dir);
+    defer state.deinit(allocator);
+    var state_dirty = false;
+    var bootstrap_exists = fileExistsAbsolute(bootstrap_path);
+
+    if (state.bootstrap_seeded_at == null and bootstrap_exists) {
+        try markBootstrapSeededAt(allocator, &state);
+        state_dirty = true;
+    }
+
+    if (state.onboarding_completed_at == null and state.bootstrap_seeded_at != null and !bootstrap_exists) {
+        try markOnboardingCompletedAt(allocator, &state);
+        state_dirty = true;
+    }
+
+    if (state.bootstrap_seeded_at == null and state.onboarding_completed_at == null and !bootstrap_exists) {
+        const legacy_completed = try isLegacyOnboardingCompleted(
+            allocator,
+            workspace_dir,
+            identity_template,
+            user_template,
+        );
+        if (legacy_completed) {
+            try markOnboardingCompletedAt(allocator, &state);
+            state_dirty = true;
+        } else {
+            try writeIfMissing(allocator, workspace_dir, "BOOTSTRAP.md", bootstrapTemplate());
+            bootstrap_exists = fileExistsAbsolute(bootstrap_path);
+            if (bootstrap_exists and state.bootstrap_seeded_at == null) {
+                try markBootstrapSeededAt(allocator, &state);
+                state_dirty = true;
+            }
+        }
+    }
+
+    if (state_dirty) {
+        try writeWorkspaceOnboardingState(allocator, workspace_dir, &state);
+    }
+}
+
+fn isLegacyOnboardingCompleted(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    identity_template: []const u8,
+    user_template: []const u8,
+) !bool {
+    const identity_path = try std.fmt.allocPrint(allocator, "{s}/IDENTITY.md", .{workspace_dir});
+    defer allocator.free(identity_path);
+    const user_path = try std.fmt.allocPrint(allocator, "{s}/USER.md", .{workspace_dir});
+    defer allocator.free(user_path);
+
+    const identity_content = try readFileIfPresent(allocator, identity_path, 1024 * 1024) orelse return false;
+    defer allocator.free(identity_content);
+    const user_content = try readFileIfPresent(allocator, user_path, 1024 * 1024) orelse return false;
+    defer allocator.free(user_content);
+
+    return !std.mem.eql(u8, identity_content, identity_template) or
+        !std.mem.eql(u8, user_content, user_template);
+}
+
+fn workspaceStatePath(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}/{s}",
+        .{ workspace_dir, WORKSPACE_STATE_DIR, WORKSPACE_STATE_FILE },
+    );
+}
+
+fn readWorkspaceOnboardingState(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+) !WorkspaceOnboardingState {
+    const path = try workspaceStatePath(allocator, workspace_dir);
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return .{},
+        else => return err,
+    };
+    defer file.close();
+
+    const raw = file.readToEndAlloc(allocator, 64 * 1024) catch return .{};
+    defer allocator.free(raw);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return .{};
+    defer parsed.deinit();
+
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return .{},
+    };
+
+    var state = WorkspaceOnboardingState{};
+    errdefer state.deinit(allocator);
+
+    if (obj.get("version")) |v| {
+        switch (v) {
+            .integer => |n| {
+                if (n > 0) state.version = n;
+            },
+            else => {},
+        }
+    }
+
+    if (obj.get("bootstrap_seeded_at")) |v| {
+        switch (v) {
+            .string => |s| state.bootstrap_seeded_at = try allocator.dupe(u8, s),
+            else => {},
+        }
+    } else if (obj.get("bootstrapSeededAt")) |v| {
+        switch (v) {
+            .string => |s| state.bootstrap_seeded_at = try allocator.dupe(u8, s),
+            else => {},
+        }
+    }
+
+    if (obj.get("onboarding_completed_at")) |v| {
+        switch (v) {
+            .string => |s| state.onboarding_completed_at = try allocator.dupe(u8, s),
+            else => {},
+        }
+    } else if (obj.get("onboardingCompletedAt")) |v| {
+        switch (v) {
+            .string => |s| state.onboarding_completed_at = try allocator.dupe(u8, s),
+            else => {},
+        }
+    }
+
+    return state;
+}
+
+fn writeWorkspaceOnboardingState(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    state: *const WorkspaceOnboardingState,
+) !void {
+    const path = try workspaceStatePath(allocator, workspace_dir);
+    defer allocator.free(path);
+
+    if (std.fs.path.dirname(path)) |parent| {
+        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{\n  ");
+    try json_util.appendJsonInt(&buf, allocator, "version", state.version);
+    if (state.bootstrap_seeded_at) |seeded| {
+        try buf.appendSlice(allocator, ",\n  ");
+        try json_util.appendJsonKey(&buf, allocator, "bootstrap_seeded_at");
+        try json_util.appendJsonString(&buf, allocator, seeded);
+    }
+    if (state.onboarding_completed_at) |completed| {
+        try buf.appendSlice(allocator, ",\n  ");
+        try json_util.appendJsonKey(&buf, allocator, "onboarding_completed_at");
+        try json_util.appendJsonString(&buf, allocator, completed);
+    }
+    try buf.appendSlice(allocator, "\n}\n");
+
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+
+    const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+    errdefer tmp_file.close();
+    try tmp_file.writeAll(buf.items);
+    tmp_file.close();
+
+    std.fs.renameAbsolute(tmp_path, path) catch {
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        const file = try std.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(buf.items);
+    };
+}
+
+fn readFileIfPresent(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) !?[]u8 {
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close();
+    return try file.readToEndAlloc(allocator, max_bytes);
+}
+
+fn fileExistsAbsolute(path: []const u8) bool {
+    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
+    file.close();
+    return true;
+}
+
+fn makeIsoTimestamp(allocator: std.mem.Allocator) ![]u8 {
+    var ts_buf: [32]u8 = undefined;
+    const ts = util.timestamp(&ts_buf);
+    return allocator.dupe(u8, ts);
+}
+
+fn markBootstrapSeededAt(allocator: std.mem.Allocator, state: *WorkspaceOnboardingState) !void {
+    if (state.bootstrap_seeded_at != null) return;
+    state.bootstrap_seeded_at = try makeIsoTimestamp(allocator);
+}
+
+fn markOnboardingCompletedAt(allocator: std.mem.Allocator, state: *WorkspaceOnboardingState) !void {
+    if (state.onboarding_completed_at != null) return;
+    state.onboarding_completed_at = try makeIsoTimestamp(allocator);
 }
 
 fn memoryTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]const u8 {
@@ -1878,6 +2116,86 @@ test "scaffoldWorkspace is idempotent" {
     try scaffoldWorkspace(std.testing.allocator, base, &ctx);
     // Running again should not fail
     try scaffoldWorkspace(std.testing.allocator, base, &ctx);
+}
+
+test "scaffoldWorkspace seeds bootstrap marker for new workspace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+
+    const bootstrap_file = try tmp.dir.openFile("BOOTSTRAP.md", .{});
+    bootstrap_file.close();
+
+    var state = try readWorkspaceOnboardingState(std.testing.allocator, base);
+    defer state.deinit(std.testing.allocator);
+    try std.testing.expect(state.bootstrap_seeded_at != null);
+    try std.testing.expect(state.onboarding_completed_at == null);
+}
+
+test "scaffoldWorkspace does not recreate BOOTSTRAP after onboarding completion" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+
+    {
+        const f = try tmp.dir.createFile("IDENTITY.md", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("custom identity");
+    }
+    {
+        const f = try tmp.dir.createFile("USER.md", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("custom user");
+    }
+
+    try tmp.dir.deleteFile("BOOTSTRAP.md");
+    try tmp.dir.deleteFile("TOOLS.md");
+
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+    const tools_file = try tmp.dir.openFile("TOOLS.md", .{});
+    tools_file.close();
+
+    var state = try readWorkspaceOnboardingState(std.testing.allocator, base);
+    defer state.deinit(std.testing.allocator);
+    try std.testing.expect(state.onboarding_completed_at != null);
+}
+
+test "scaffoldWorkspace does not seed BOOTSTRAP for legacy completed workspace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("IDENTITY.md", .{});
+        defer f.close();
+        try f.writeAll("custom identity");
+    }
+    {
+        const f = try tmp.dir.createFile("USER.md", .{});
+        defer f.close();
+        try f.writeAll("custom user");
+    }
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+
+    var state = try readWorkspaceOnboardingState(std.testing.allocator, base);
+    defer state.deinit(std.testing.allocator);
+    try std.testing.expect(state.bootstrap_seeded_at == null);
+    try std.testing.expect(state.onboarding_completed_at != null);
 }
 
 // ── Additional onboard tests ────────────────────────────────────

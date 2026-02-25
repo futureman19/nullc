@@ -81,12 +81,14 @@ fn buildIdentitySection(
         "USER.md",
         "HEARTBEAT.md",
         "BOOTSTRAP.md",
-        "MEMORY.md",
     };
 
     for (identity_files) |filename| {
         try injectWorkspaceFile(allocator, w, workspace_dir, filename);
     }
+
+    // Match OpenClaw behavior: inject MEMORY.md if present, otherwise fallback to memory.md.
+    try injectPreferredMemoryFile(allocator, w, workspace_dir);
 }
 
 fn buildToolsSection(w: anytype, tools: []const Tool) !void {
@@ -244,6 +246,32 @@ fn injectWorkspaceFile(
     }
 }
 
+fn injectPreferredMemoryFile(
+    allocator: std.mem.Allocator,
+    w: anytype,
+    workspace_dir: []const u8,
+) !void {
+    if (workspaceFileExists(allocator, workspace_dir, "MEMORY.md")) {
+        try injectWorkspaceFile(allocator, w, workspace_dir, "MEMORY.md");
+        return;
+    }
+    if (workspaceFileExists(allocator, workspace_dir, "memory.md")) {
+        try injectWorkspaceFile(allocator, w, workspace_dir, "memory.md");
+    }
+}
+
+fn workspaceFileExists(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    filename: []const u8,
+) bool {
+    const path = std.fs.path.join(allocator, &.{ workspace_dir, filename }) catch return false;
+    defer allocator.free(path);
+    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
+    file.close();
+    return true;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
@@ -276,6 +304,73 @@ test "buildSystemPrompt includes workspace dir" {
     defer allocator.free(prompt);
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "/my/workspace") != null);
+}
+
+test "buildSystemPrompt injects memory.md when MEMORY.md is absent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("memory.md", .{});
+        defer f.close();
+        try f.writeAll("alt-memory");
+    }
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const prompt = try buildSystemPrompt(std.testing.allocator, .{
+        .workspace_dir = workspace,
+        .model_name = "test-model",
+        .tools = &.{},
+    });
+    defer std.testing.allocator.free(prompt);
+
+    const has_memory_header = std.mem.indexOf(u8, prompt, "### memory.md") != null or
+        std.mem.indexOf(u8, prompt, "### MEMORY.md") != null;
+    try std.testing.expect(has_memory_header);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "alt-memory") != null);
+}
+
+test "buildSystemPrompt prefers MEMORY.md over memory.md" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const primary = try tmp.dir.createFile("MEMORY.md", .{});
+        defer primary.close();
+        try primary.writeAll("primary-memory");
+    }
+
+    var has_distinct_case_files = true;
+    const alt = tmp.dir.createFile("memory.md", .{ .exclusive = true }) catch |err| switch (err) {
+        error.PathAlreadyExists => blk: {
+            has_distinct_case_files = false;
+            break :blk null;
+        },
+        else => return err,
+    };
+    if (alt) |f| {
+        defer f.close();
+        try f.writeAll("alt-memory");
+    }
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const prompt = try buildSystemPrompt(std.testing.allocator, .{
+        .workspace_dir = workspace,
+        .model_name = "test-model",
+        .tools = &.{},
+    });
+    defer std.testing.allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "### MEMORY.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "primary-memory") != null);
+    if (has_distinct_case_files) {
+        try std.testing.expect(std.mem.indexOf(u8, prompt, "alt-memory") == null);
+        try std.testing.expect(std.mem.indexOf(u8, prompt, "### memory.md") == null);
+    }
 }
 
 test "appendDateTimeSection outputs UTC timestamp" {
