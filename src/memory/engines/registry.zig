@@ -131,25 +131,30 @@ const none_backend = BackendDescriptor{
     .create = &createNone,
 };
 
-const minimal_backends = [_]BackendDescriptor{
+const base_backends = [_]BackendDescriptor{
     markdown_backend,
     api_backend,
     memory_backend,
     none_backend,
 };
 
-const full_backends = [_]BackendDescriptor{
+const sqlite_backends = if (build_options.enable_memory_sqlite) [_]BackendDescriptor{
     sqlite_backend,
-    markdown_backend,
-    lucid_backend,
-    memory_backend,
-    redis_backend,
-    lancedb_backend,
-    api_backend,
-    none_backend,
-};
+} else [0]BackendDescriptor{};
 
-const pg_backends = if (!build_options.minimal_memory_backends and build_options.enable_postgres) [_]BackendDescriptor{.{
+const lucid_backends = if (build_options.enable_memory_lucid) [_]BackendDescriptor{
+    lucid_backend,
+} else [0]BackendDescriptor{};
+
+const redis_backends = if (build_options.enable_memory_redis) [_]BackendDescriptor{
+    redis_backend,
+} else [0]BackendDescriptor{};
+
+const lancedb_backends = if (build_options.enable_memory_lancedb) [_]BackendDescriptor{
+    lancedb_backend,
+} else [0]BackendDescriptor{};
+
+const pg_backends = if (build_options.enable_postgres) [_]BackendDescriptor{.{
     .name = "postgres",
     .label = "PostgreSQL — remote/shared memory store",
     .auto_save_default = true,
@@ -159,10 +164,7 @@ const pg_backends = if (!build_options.minimal_memory_backends and build_options
     .create = &createPostgres,
 }} else [0]BackendDescriptor{};
 
-pub const all = if (build_options.minimal_memory_backends)
-    minimal_backends ++ pg_backends
-else
-    full_backends ++ pg_backends;
+pub const all = base_backends ++ sqlite_backends ++ lucid_backends ++ redis_backends ++ lancedb_backends ++ pg_backends;
 
 // ── Lookup ───────────────────────────────────────────────────────
 
@@ -331,17 +333,17 @@ fn applyPostgresConnectTimeout(
 // ── Tests ────────────────────────────────────────────────────────
 
 test "registry length" {
-    const expected: usize = if (build_options.minimal_memory_backends)
-        4
-    else if (build_options.enable_postgres)
-        9
-    else
-        8;
+    const expected: usize = 4 +
+        @as(usize, @intFromBool(build_options.enable_memory_sqlite)) +
+        @as(usize, @intFromBool(build_options.enable_memory_lucid)) +
+        @as(usize, @intFromBool(build_options.enable_memory_redis)) +
+        @as(usize, @intFromBool(build_options.enable_memory_lancedb)) +
+        @as(usize, @intFromBool(build_options.enable_postgres));
     try std.testing.expectEqual(expected, all.len);
 }
 
 test "findBackend sqlite" {
-    if (build_options.minimal_memory_backends) {
+    if (!build_options.enable_memory_sqlite) {
         try std.testing.expect(findBackend("sqlite") == null);
         return;
     }
@@ -367,7 +369,7 @@ test "findBackend markdown" {
 }
 
 test "findBackend lucid" {
-    if (build_options.minimal_memory_backends) {
+    if (!build_options.enable_memory_lucid) {
         try std.testing.expect(findBackend("lucid") == null);
         return;
     }
@@ -390,7 +392,7 @@ test "findBackend none" {
 }
 
 test "findBackend redis" {
-    if (build_options.minimal_memory_backends) {
+    if (!build_options.enable_memory_redis) {
         try std.testing.expect(findBackend("redis") == null);
         return;
     }
@@ -404,7 +406,7 @@ test "findBackend redis" {
 }
 
 test "findBackend lancedb" {
-    if (build_options.minimal_memory_backends) {
+    if (!build_options.enable_memory_lancedb) {
         try std.testing.expect(findBackend("lancedb") == null);
         return;
     }
@@ -438,7 +440,7 @@ test "findBackend empty returns null" {
 }
 
 test "resolvePaths sqlite has db_path" {
-    if (build_options.minimal_memory_backends) {
+    if (!build_options.enable_memory_sqlite) {
         try std.testing.expect(findBackend("sqlite") == null);
         return;
     }
@@ -491,7 +493,7 @@ test "createNone returns session_store null" {
 }
 
 test "resolvePaths redis config is preserved" {
-    if (build_options.minimal_memory_backends) {
+    if (!build_options.enable_memory_redis) {
         try std.testing.expect(findBackend("redis") == null);
         return;
     }

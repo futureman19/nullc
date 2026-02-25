@@ -453,9 +453,11 @@ pub const MemoryProfile = enum {
 };
 
 pub const MemoryConfig = struct {
+    pub const DEFAULT_MEMORY_BACKEND: []const u8 = "markdown";
+
     /// Profile preset — convenience shortcut for common setups.
-    profile: []const u8 = "local_keyword",
-    backend: []const u8 = "sqlite",
+    profile: []const u8 = "markdown_only",
+    backend: []const u8 = DEFAULT_MEMORY_BACKEND,
     auto_save: bool = true,
     citations: []const u8 = "auto",
     search: MemorySearchConfig = .{},
@@ -475,29 +477,30 @@ pub const MemoryConfig = struct {
         const p = MemoryProfile.fromString(self.profile);
         switch (p) {
             .local_keyword => {
-                // Defaults already match local_keyword — no changes needed.
+                if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "sqlite";
             },
             .markdown_only => {
-                if (std.mem.eql(u8, self.backend, "sqlite")) self.backend = "markdown";
+                // Base default is already markdown.
             },
             .postgres_keyword => {
-                if (std.mem.eql(u8, self.backend, "sqlite")) self.backend = "postgres";
+                if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "postgres";
             },
             .local_hybrid => {
                 // SQLite + vector hybrid
+                if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "sqlite";
                 if (std.mem.eql(u8, self.search.provider, "none")) self.search.provider = "openai";
                 if (!self.search.query.hybrid.enabled) self.search.query.hybrid.enabled = true;
                 if (std.mem.eql(u8, self.reliability.rollout_mode, "off")) self.reliability.rollout_mode = "on";
             },
             .postgres_hybrid => {
-                if (std.mem.eql(u8, self.backend, "sqlite")) self.backend = "postgres";
+                if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "postgres";
                 if (std.mem.eql(u8, self.search.provider, "none")) self.search.provider = "openai";
                 if (!self.search.query.hybrid.enabled) self.search.query.hybrid.enabled = true;
                 if (std.mem.eql(u8, self.search.store.kind, "auto")) self.search.store.kind = "pgvector";
                 if (std.mem.eql(u8, self.reliability.rollout_mode, "off")) self.reliability.rollout_mode = "on";
             },
             .minimal_none => {
-                if (std.mem.eql(u8, self.backend, "sqlite")) self.backend = "none";
+                if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "none";
                 if (self.auto_save) self.auto_save = false;
             },
             .custom => {

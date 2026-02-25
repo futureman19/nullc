@@ -1198,8 +1198,7 @@ pub fn selectableBackends() []const memory_root.BackendDescriptor {
 
 /// Get the default memory backend key.
 pub fn defaultBackendKey() []const u8 {
-    if (build_options.minimal_memory_backends) return "markdown";
-    return "sqlite";
+    return "markdown";
 }
 
 // ── Path helpers ─────────────────────────────────────────────────
@@ -1266,11 +1265,7 @@ test "known_providers has entries" {
 test "selectableBackends returns non-empty" {
     const backends = selectableBackends();
     try std.testing.expect(backends.len >= 3);
-    if (build_options.minimal_memory_backends) {
-        try std.testing.expectEqualStrings("markdown", backends[0].name);
-    } else {
-        try std.testing.expectEqualStrings("sqlite", backends[0].name);
-    }
+    try std.testing.expectEqualStrings("markdown", backends[0].name);
 }
 
 test "BANNER contains descriptive text" {
@@ -1484,16 +1479,12 @@ test "defaultBackendKey returns non-empty" {
 
 test "selectableBackends has expected backends" {
     const backends = selectableBackends();
-    // Full profile includes sqlite; minimal profile intentionally excludes it.
+    // SQLite is optional and controlled by build flag.
     var has_sqlite = false;
     for (backends) |b| {
         if (std.mem.eql(u8, b.name, "sqlite")) has_sqlite = true;
     }
-    if (build_options.minimal_memory_backends) {
-        try std.testing.expect(!has_sqlite);
-    } else {
-        try std.testing.expect(has_sqlite);
-    }
+    try std.testing.expectEqual(build_options.enable_memory_sqlite, has_sqlite);
 }
 
 // ── Wizard helper tests ─────────────────────────────────────────

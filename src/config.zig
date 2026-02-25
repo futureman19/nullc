@@ -120,7 +120,7 @@ pub const Config = struct {
     // These are set during load() to mirror nested values.
     temperature: f64 = 0.7,
     max_tokens: ?u32 = null,
-    memory_backend: []const u8 = "sqlite",
+    memory_backend: []const u8 = config_types.MemoryConfig.DEFAULT_MEMORY_BACKEND,
     memory_auto_save: bool = true,
     heartbeat_enabled: bool = false,
     heartbeat_interval_minutes: u32 = 30,

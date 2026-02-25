@@ -5,9 +5,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "2026.2.23";
-    const minimal_memory_backends = b.option(bool, "minimal-memory-backends", "Expose only markdown/api/memory/none memory backends") orelse false;
-    const enable_postgres_requested = b.option(bool, "enable-postgres", "Link libpq for PostgreSQL backend (requires libpq-dev)") orelse false;
-    const enable_postgres = enable_postgres_requested and !minimal_memory_backends;
+    const enable_memory_sqlite = b.option(bool, "enable-memory-sqlite", "Enable SQLite memory backend") orelse false;
+    const enable_memory_lucid = b.option(bool, "enable-memory-lucid", "Enable Lucid memory backend") orelse false;
+    const enable_memory_redis = b.option(bool, "enable-memory-redis", "Enable Redis memory backend") orelse false;
+    const enable_memory_lancedb = b.option(bool, "enable-memory-lancedb", "Enable LanceDB memory backend") orelse false;
+    const enable_postgres = b.option(bool, "enable-postgres", "Enable PostgreSQL memory backend and pgvector (requires libpq-dev)") orelse false;
 
     const sqlite3_dep = b.dependency("sqlite3", .{
         .target = target,
@@ -19,7 +21,10 @@ pub fn build(b: *std.Build) void {
     var build_options = b.addOptions();
     build_options.addOption([]const u8, "version", app_version);
     build_options.addOption(bool, "enable_postgres", enable_postgres);
-    build_options.addOption(bool, "minimal_memory_backends", minimal_memory_backends);
+    build_options.addOption(bool, "enable_memory_sqlite", enable_memory_sqlite);
+    build_options.addOption(bool, "enable_memory_lucid", enable_memory_lucid);
+    build_options.addOption(bool, "enable_memory_redis", enable_memory_redis);
+    build_options.addOption(bool, "enable_memory_lancedb", enable_memory_lancedb);
     const build_options_module = build_options.createModule();
 
     // ---------- library module (importable by consumers) ----------
