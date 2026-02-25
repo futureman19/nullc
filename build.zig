@@ -5,7 +5,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "2026.2.23";
-    const enable_postgres = b.option(bool, "enable-postgres", "Link libpq for PostgreSQL backend (requires libpq-dev)") orelse false;
+    const minimal_memory_backends = b.option(bool, "minimal-memory-backends", "Expose only markdown/memory/none memory backends") orelse false;
+    const enable_postgres_requested = b.option(bool, "enable-postgres", "Link libpq for PostgreSQL backend (requires libpq-dev)") orelse false;
+    const enable_postgres = enable_postgres_requested and !minimal_memory_backends;
 
     const sqlite3_dep = b.dependency("sqlite3", .{
         .target = target,
@@ -17,6 +19,7 @@ pub fn build(b: *std.Build) void {
     var build_options = b.addOptions();
     build_options.addOption([]const u8, "version", app_version);
     build_options.addOption(bool, "enable_postgres", enable_postgres);
+    build_options.addOption(bool, "minimal_memory_backends", minimal_memory_backends);
     const build_options_module = build_options.createModule();
 
     // ---------- library module (importable by consumers) ----------

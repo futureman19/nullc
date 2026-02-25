@@ -51,82 +51,104 @@ pub const BackendInstance = struct {
 
 // ── Comptime registry ────────────────────────────────────────────
 
-const base_backends = [_]BackendDescriptor{
-    .{
-        .name = "sqlite",
-        .label = "SQLite with FTS5 search (recommended)",
-        .auto_save_default = true,
-        .capabilities = .{ .supports_keyword_rank = true, .supports_session_store = true, .supports_transactions = true, .supports_outbox = true },
-        .needs_db_path = true,
-        .needs_workspace = false,
-        .create = &createSqlite,
-    },
-    .{
-        .name = "markdown",
-        .label = "Markdown files — simple, human-readable",
-        .auto_save_default = true,
-        .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
-        .needs_db_path = false,
-        .needs_workspace = true,
-        .create = &createMarkdown,
-    },
-    .{
-        .name = "lucid",
-        .label = "Lucid — SQLite + cross-project memory sync via lucid CLI",
-        .auto_save_default = true,
-        .capabilities = .{ .supports_keyword_rank = true, .supports_session_store = true, .supports_transactions = true, .supports_outbox = true },
-        .needs_db_path = true,
-        .needs_workspace = true,
-        .create = &createLucid,
-    },
-    .{
-        .name = "memory",
-        .label = "In-memory LRU — no persistence, ideal for testing",
-        .auto_save_default = false,
-        .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
-        .needs_db_path = false,
-        .needs_workspace = false,
-        .create = &createMemoryLru,
-    },
-    .{
-        .name = "redis",
-        .label = "Redis — distributed in-memory store with optional TTL",
-        .auto_save_default = true,
-        .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
-        .needs_db_path = false,
-        .needs_workspace = false,
-        .create = &createRedis,
-    },
-    .{
-        .name = "lancedb",
-        .label = "LanceDB — SQLite + vector-augmented recall",
-        .auto_save_default = true,
-        .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
-        .needs_db_path = true,
-        .needs_workspace = false,
-        .create = &createLanceDb,
-    },
-    .{
-        .name = "api",
-        .label = "HTTP API — delegate to external REST service",
-        .auto_save_default = true,
-        .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = true, .supports_transactions = false, .supports_outbox = false },
-        .needs_db_path = false,
-        .needs_workspace = false,
-        .create = &createApi,
-    },
-    .{
-        .name = "none",
-        .label = "None — disable persistent memory",
-        .auto_save_default = false,
-        .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
-        .needs_db_path = false,
-        .needs_workspace = false,
-        .create = &createNone,
-    },
+const sqlite_backend = BackendDescriptor{
+    .name = "sqlite",
+    .label = "SQLite with FTS5 search (recommended)",
+    .auto_save_default = true,
+    .capabilities = .{ .supports_keyword_rank = true, .supports_session_store = true, .supports_transactions = true, .supports_outbox = true },
+    .needs_db_path = true,
+    .needs_workspace = false,
+    .create = &createSqlite,
 };
 
-const pg_backends = if (build_options.enable_postgres) [_]BackendDescriptor{.{
+const markdown_backend = BackendDescriptor{
+    .name = "markdown",
+    .label = "Markdown files — simple, human-readable",
+    .auto_save_default = true,
+    .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
+    .needs_db_path = false,
+    .needs_workspace = true,
+    .create = &createMarkdown,
+};
+
+const lucid_backend = BackendDescriptor{
+    .name = "lucid",
+    .label = "Lucid — SQLite + cross-project memory sync via lucid CLI",
+    .auto_save_default = true,
+    .capabilities = .{ .supports_keyword_rank = true, .supports_session_store = true, .supports_transactions = true, .supports_outbox = true },
+    .needs_db_path = true,
+    .needs_workspace = true,
+    .create = &createLucid,
+};
+
+const memory_backend = BackendDescriptor{
+    .name = "memory",
+    .label = "In-memory LRU — no persistence, ideal for testing",
+    .auto_save_default = false,
+    .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
+    .needs_db_path = false,
+    .needs_workspace = false,
+    .create = &createMemoryLru,
+};
+
+const redis_backend = BackendDescriptor{
+    .name = "redis",
+    .label = "Redis — distributed in-memory store with optional TTL",
+    .auto_save_default = true,
+    .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
+    .needs_db_path = false,
+    .needs_workspace = false,
+    .create = &createRedis,
+};
+
+const lancedb_backend = BackendDescriptor{
+    .name = "lancedb",
+    .label = "LanceDB — SQLite + vector-augmented recall",
+    .auto_save_default = true,
+    .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
+    .needs_db_path = true,
+    .needs_workspace = false,
+    .create = &createLanceDb,
+};
+
+const api_backend = BackendDescriptor{
+    .name = "api",
+    .label = "HTTP API — delegate to external REST service",
+    .auto_save_default = true,
+    .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = true, .supports_transactions = false, .supports_outbox = false },
+    .needs_db_path = false,
+    .needs_workspace = false,
+    .create = &createApi,
+};
+
+const none_backend = BackendDescriptor{
+    .name = "none",
+    .label = "None — disable persistent memory",
+    .auto_save_default = false,
+    .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
+    .needs_db_path = false,
+    .needs_workspace = false,
+    .create = &createNone,
+};
+
+const minimal_backends = [_]BackendDescriptor{
+    markdown_backend,
+    memory_backend,
+    none_backend,
+};
+
+const full_backends = [_]BackendDescriptor{
+    sqlite_backend,
+    markdown_backend,
+    lucid_backend,
+    memory_backend,
+    redis_backend,
+    lancedb_backend,
+    api_backend,
+    none_backend,
+};
+
+const pg_backends = if (!build_options.minimal_memory_backends and build_options.enable_postgres) [_]BackendDescriptor{.{
     .name = "postgres",
     .label = "PostgreSQL — remote/shared memory store",
     .auto_save_default = true,
@@ -136,7 +158,10 @@ const pg_backends = if (build_options.enable_postgres) [_]BackendDescriptor{.{
     .create = &createPostgres,
 }} else [0]BackendDescriptor{};
 
-pub const all = base_backends ++ pg_backends;
+pub const all = if (build_options.minimal_memory_backends)
+    minimal_backends ++ pg_backends
+else
+    full_backends ++ pg_backends;
 
 // ── Lookup ───────────────────────────────────────────────────────
 
@@ -305,11 +330,20 @@ fn applyPostgresConnectTimeout(
 // ── Tests ────────────────────────────────────────────────────────
 
 test "registry length" {
-    const expected: usize = if (build_options.enable_postgres) 9 else 8;
+    const expected: usize = if (build_options.minimal_memory_backends)
+        3
+    else if (build_options.enable_postgres)
+        9
+    else
+        8;
     try std.testing.expectEqual(expected, all.len);
 }
 
 test "findBackend sqlite" {
+    if (build_options.minimal_memory_backends) {
+        try std.testing.expect(findBackend("sqlite") == null);
+        return;
+    }
     const desc = findBackend("sqlite") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("sqlite", desc.name);
     try std.testing.expect(desc.capabilities.supports_keyword_rank);
@@ -332,6 +366,10 @@ test "findBackend markdown" {
 }
 
 test "findBackend lucid" {
+    if (build_options.minimal_memory_backends) {
+        try std.testing.expect(findBackend("lucid") == null);
+        return;
+    }
     const desc = findBackend("lucid") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("lucid", desc.name);
     try std.testing.expect(desc.capabilities.supports_keyword_rank);
@@ -351,6 +389,10 @@ test "findBackend none" {
 }
 
 test "findBackend redis" {
+    if (build_options.minimal_memory_backends) {
+        try std.testing.expect(findBackend("redis") == null);
+        return;
+    }
     const desc = findBackend("redis") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("redis", desc.name);
     try std.testing.expect(!desc.capabilities.supports_keyword_rank);
@@ -361,6 +403,10 @@ test "findBackend redis" {
 }
 
 test "findBackend lancedb" {
+    if (build_options.minimal_memory_backends) {
+        try std.testing.expect(findBackend("lancedb") == null);
+        return;
+    }
     const desc = findBackend("lancedb") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("lancedb", desc.name);
     try std.testing.expect(!desc.capabilities.supports_keyword_rank);
@@ -371,6 +417,10 @@ test "findBackend lancedb" {
 }
 
 test "findBackend api" {
+    if (build_options.minimal_memory_backends) {
+        try std.testing.expect(findBackend("api") == null);
+        return;
+    }
     const desc = findBackend("api") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("api", desc.name);
     try std.testing.expect(!desc.capabilities.supports_keyword_rank);
@@ -391,6 +441,10 @@ test "findBackend empty returns null" {
 }
 
 test "resolvePaths sqlite has db_path" {
+    if (build_options.minimal_memory_backends) {
+        try std.testing.expect(findBackend("sqlite") == null);
+        return;
+    }
     const desc = findBackend("sqlite") orelse return error.TestUnexpectedResult;
     const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null, null);
     defer if (cfg.db_path) |p| std.testing.allocator.free(std.mem.span(p));
@@ -440,6 +494,10 @@ test "createNone returns session_store null" {
 }
 
 test "resolvePaths redis config is preserved" {
+    if (build_options.minimal_memory_backends) {
+        try std.testing.expect(findBackend("redis") == null);
+        return;
+    }
     const desc = findBackend("redis") orelse return error.TestUnexpectedResult;
     const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, .{
         .host = "10.10.10.10",

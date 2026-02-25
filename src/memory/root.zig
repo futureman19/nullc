@@ -1215,6 +1215,7 @@ test "initRuntime none has null db_path" {
 }
 
 test "initRuntime sqlite returns full runtime" {
+    if (build_options.minimal_memory_backends) return;
     var rt = initRuntime(std.testing.allocator, &.{}, "/tmp") orelse
         return error.TestUnexpectedResult;
     defer rt.deinit();
@@ -1363,6 +1364,7 @@ test "initRuntime with search.provider=none has no vector store" {
 }
 
 test "initRuntime resolves sqlite_sidecar mode when explicitly configured" {
+    if (build_options.minimal_memory_backends) return;
     var rt = initRuntime(std.testing.allocator, &.{
         .backend = "sqlite",
         .search = .{
@@ -1378,6 +1380,7 @@ test "initRuntime resolves sqlite_sidecar mode when explicitly configured" {
 }
 
 test "initRuntime uses configured relative sqlite_sidecar path" {
+    if (build_options.minimal_memory_backends) return;
     var rt = initRuntime(std.testing.allocator, &.{
         .backend = "sqlite",
         .search = .{
@@ -1396,6 +1399,7 @@ test "initRuntime uses configured relative sqlite_sidecar path" {
 }
 
 test "initRuntime uses configured absolute sqlite_sidecar path" {
+    if (build_options.minimal_memory_backends) return;
     var rt = initRuntime(std.testing.allocator, &.{
         .backend = "sqlite",
         .search = .{
@@ -1414,6 +1418,7 @@ test "initRuntime uses configured absolute sqlite_sidecar path" {
 }
 
 test "initRuntime respects search.enabled=false" {
+    if (build_options.minimal_memory_backends) return;
     var rt = initRuntime(std.testing.allocator, &.{
         .backend = "sqlite",
         .search = .{
@@ -1435,6 +1440,7 @@ test "initRuntime respects search.enabled=false" {
 }
 
 test "initRuntime durable_outbox uses max of embed/vector retry config" {
+    if (build_options.minimal_memory_backends) return;
     var rt = initRuntime(std.testing.allocator, &.{
         .backend = "sqlite",
         .search = .{
@@ -1498,6 +1504,7 @@ test "initRuntime fail_fast returns null when durable outbox is unavailable" {
 }
 
 test "syncVectorAfterStore enqueues when durable outbox is active" {
+    if (build_options.minimal_memory_backends) return;
     var rt = initRuntime(std.testing.allocator, &.{
         .backend = "sqlite",
         .search = .{
@@ -1518,6 +1525,7 @@ test "syncVectorAfterStore enqueues when durable outbox is active" {
 }
 
 test "deleteFromVectorStore enqueues delete when durable outbox is active" {
+    if (build_options.minimal_memory_backends) return;
     var rt = initRuntime(std.testing.allocator, &.{
         .backend = "sqlite",
         .search = .{
