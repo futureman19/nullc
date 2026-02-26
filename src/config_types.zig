@@ -65,6 +65,12 @@ pub const DiagnosticsConfig = struct {
     /// Emit info logs when a user message is received by SessionManager.
     /// Only metadata is logged (channel/session hash/message size), not content.
     log_message_receipts: bool = false,
+    /// Emit full inbound/outbound user-visible message payloads.
+    /// Intended for local debugging only (can include sensitive text).
+    log_message_payloads: bool = false,
+    /// Emit request/response payloads around provider chat calls.
+    /// Intended for local debugging only (can include sensitive text).
+    log_llm_io: bool = false,
 };
 
 pub const AutonomyConfig = struct {

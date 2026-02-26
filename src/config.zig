@@ -558,6 +558,8 @@ pub const Config = struct {
         try w.print("    \"backend\": \"{s}\"", .{self.diagnostics.backend});
         try w.print(",\n    \"log_tool_calls\": {s}", .{if (self.diagnostics.log_tool_calls) "true" else "false"});
         try w.print(",\n    \"log_message_receipts\": {s}", .{if (self.diagnostics.log_message_receipts) "true" else "false"});
+        try w.print(",\n    \"log_message_payloads\": {s}", .{if (self.diagnostics.log_message_payloads) "true" else "false"});
+        try w.print(",\n    \"log_llm_io\": {s}", .{if (self.diagnostics.log_llm_io) "true" else "false"});
         if (self.diagnostics.otel_endpoint != null or self.diagnostics.otel_service_name != null) {
             try w.print(",\n    \"otel\": {{", .{});
             var otel_first = true;
@@ -1044,6 +1046,8 @@ test "save roundtrip preserves diagnostics logging flags" {
     };
     cfg.diagnostics.log_tool_calls = true;
     cfg.diagnostics.log_message_receipts = true;
+    cfg.diagnostics.log_message_payloads = true;
+    cfg.diagnostics.log_llm_io = true;
     try cfg.save();
 
     const file = try std.fs.openFileAbsolute(config_path, .{});
@@ -1062,6 +1066,8 @@ test "save roundtrip preserves diagnostics logging flags" {
 
     try std.testing.expect(loaded.diagnostics.log_tool_calls);
     try std.testing.expect(loaded.diagnostics.log_message_receipts);
+    try std.testing.expect(loaded.diagnostics.log_message_payloads);
+    try std.testing.expect(loaded.diagnostics.log_llm_io);
 }
 
 test "save roundtrip preserves reliability settings" {
@@ -1550,13 +1556,15 @@ test "validation accepts max boundary backoff" {
 test "json parse diagnostics section" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"diagnostics": {"backend": "otel", "log_tool_calls": true, "log_message_receipts": true, "otel": {"endpoint": "http://localhost:4318", "service_name": "yc"}}}
+        \\{"diagnostics": {"backend": "otel", "log_tool_calls": true, "log_message_receipts": true, "log_message_payloads": true, "log_llm_io": true, "otel": {"endpoint": "http://localhost:4318", "service_name": "yc"}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expectEqualStrings("otel", cfg.diagnostics.backend);
     try std.testing.expect(cfg.diagnostics.log_tool_calls);
     try std.testing.expect(cfg.diagnostics.log_message_receipts);
+    try std.testing.expect(cfg.diagnostics.log_message_payloads);
+    try std.testing.expect(cfg.diagnostics.log_llm_io);
     try std.testing.expectEqualStrings("http://localhost:4318", cfg.diagnostics.otel_endpoint.?);
     try std.testing.expectEqualStrings("yc", cfg.diagnostics.otel_service_name.?);
     allocator.free(cfg.diagnostics.backend);
