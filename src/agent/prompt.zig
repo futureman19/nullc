@@ -852,7 +852,7 @@ test "installSkill end-to-end appears in buildSystemPrompt" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Available Skills") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "name=\"e2e-installed-skill\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "path=\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "e2e-installed-skill/SKILL.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "source/SKILL.md") != null);
 }
 
 test "buildSystemPrompt datetime appears before runtime" {

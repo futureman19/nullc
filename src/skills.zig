@@ -4,8 +4,9 @@ const platform = @import("platform.zig");
 // Skills — user-defined capabilities loaded from disk.
 //
 // Each skill lives in ~/.nullclaw/workspace/skills/<name>/ with:
-//   - skill.json  — manifest (name, version, description, author), optional for markdown-only skills
-//   - SKILL.md    — instruction text (required for markdown-only skills)
+//   - SKILL.toml  — preferred manifest format (zeroclaw-compatible)
+//   - skill.json  — legacy manifest format (optional)
+//   - SKILL.md    — instruction text
 //
 // The skillforge module handles discovery and evaluation;
 // this module handles definition, loading, installation, and removal.
@@ -177,17 +178,131 @@ pub fn parseManifestAlloc(allocator: std.mem.Allocator, json_bytes: []const u8) 
     return m;
 }
 
+fn stripTomlInlineComment(value: []const u8) []const u8 {
+    var in_single = false;
+    var in_double = false;
+    var escaped = false;
+
+    var i: usize = 0;
+    while (i < value.len) : (i += 1) {
+        const c = value[i];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+
+        if (c == '\\' and in_double) {
+            escaped = true;
+            continue;
+        }
+        if (c == '"' and !in_single) {
+            in_double = !in_double;
+            continue;
+        }
+        if (c == '\'' and !in_double) {
+            in_single = !in_single;
+            continue;
+        }
+        if (c == '#' and !in_single and !in_double) {
+            return value[0..i];
+        }
+    }
+    return value;
+}
+
+fn parseTomlStringLiteral(raw_value: []const u8) ?[]const u8 {
+    const cleaned = std.mem.trim(u8, stripTomlInlineComment(raw_value), " \t\r");
+    if (cleaned.len < 2) return null;
+
+    const quote = cleaned[0];
+    if (quote != '"' and quote != '\'') return null;
+
+    var i: usize = 1;
+    while (i < cleaned.len) : (i += 1) {
+        if (cleaned[i] != quote) continue;
+        if (quote == '"' and i > 0 and cleaned[i - 1] == '\\') continue;
+        if (i + 1 != cleaned.len) return null;
+        return cleaned[1..i];
+    }
+    return null;
+}
+
+fn parseTomlSkillField(toml_bytes: []const u8, key: []const u8) ?[]const u8 {
+    var in_skill_section = false;
+    var lines = std.mem.splitScalar(u8, toml_bytes, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0) continue;
+
+        const section_line = std.mem.trim(u8, stripTomlInlineComment(line), " \t\r");
+        if (section_line.len >= 3 and section_line[0] == '[' and section_line[section_line.len - 1] == ']') {
+            in_skill_section = std.mem.eql(u8, section_line, "[skill]");
+            continue;
+        }
+        if (!in_skill_section) continue;
+
+        const eq_idx = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const candidate_key = std.mem.trim(u8, line[0..eq_idx], " \t");
+        if (!std.mem.eql(u8, candidate_key, key)) continue;
+
+        const value_part = line[eq_idx + 1 ..];
+        return parseTomlStringLiteral(value_part);
+    }
+    return null;
+}
+
 // ── Skill Loading ───────────────────────────────────────────────
 
 /// Load a single skill from a directory.
-/// Reads skill.json (preferred) and SKILL.md (optional for manifest-based skills).
-/// If skill.json is missing but SKILL.md exists, loads a markdown-only skill using
+/// Reads SKILL.toml (preferred), then skill.json (legacy), then SKILL.md fallback.
+/// If both manifests are missing but SKILL.md exists, loads a markdown-only skill using
 /// the directory name as skill name (zeroclaw-compatible behavior).
 pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8) !Skill {
+    const toml_path = try std.fmt.allocPrint(allocator, "{s}/SKILL.toml", .{skill_dir_path});
+    defer allocator.free(toml_path);
     const manifest_path = try std.fmt.allocPrint(allocator, "{s}/skill.json", .{skill_dir_path});
     defer allocator.free(manifest_path);
     const instructions_path = try std.fmt.allocPrint(allocator, "{s}/SKILL.md", .{skill_dir_path});
     defer allocator.free(instructions_path);
+
+    const toml_bytes = std.fs.cwd().readFileAlloc(allocator, toml_path, 128 * 1024) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return error.ManifestNotFound,
+    };
+    defer if (toml_bytes) |bytes| allocator.free(bytes);
+
+    if (toml_bytes) |toml| {
+        const toml_name = parseTomlSkillField(toml, "name") orelse return error.InvalidManifest;
+        const toml_version = parseTomlSkillField(toml, "version") orelse "0.1.0";
+        const toml_description = parseTomlSkillField(toml, "description") orelse "";
+        const toml_author = parseTomlSkillField(toml, "author") orelse "";
+
+        const name = try allocator.dupe(u8, toml_name);
+        errdefer allocator.free(name);
+        const version = try allocator.dupe(u8, toml_version);
+        errdefer allocator.free(version);
+        const description = try allocator.dupe(u8, toml_description);
+        errdefer allocator.free(description);
+        const author = try allocator.dupe(u8, toml_author);
+        errdefer allocator.free(author);
+        const path = try allocator.dupe(u8, skill_dir_path);
+        errdefer allocator.free(path);
+        const instructions = std.fs.cwd().readFileAlloc(allocator, instructions_path, 256 * 1024) catch
+            try allocator.dupe(u8, "");
+
+        return Skill{
+            .name = name,
+            .version = version,
+            .description = description,
+            .author = author,
+            .instructions = instructions,
+            .enabled = true,
+            .always = false,
+            .requires_bins = &.{},
+            .requires_env = &.{},
+            .path = path,
+        };
+    }
 
     const manifest_bytes = std.fs.cwd().readFileAlloc(allocator, manifest_path, 64 * 1024) catch |err| switch (err) {
         error.FileNotFound => null,
@@ -533,57 +648,306 @@ fn validateSkillName(name: []const u8) !void {
     if (name.len == 0 or std.mem.eql(u8, name, "..")) return error.UnsafeName;
 }
 
-fn readValidatedManifestName(allocator: std.mem.Allocator, skill_dir_path: []const u8) ![]u8 {
-    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/skill.json", .{skill_dir_path});
-    defer allocator.free(manifest_path);
-
-    const manifest_bytes = std.fs.cwd().readFileAlloc(allocator, manifest_path, 64 * 1024) catch
-        return error.ManifestNotFound;
-    defer allocator.free(manifest_bytes);
-
-    const manifest = parseManifest(manifest_bytes) catch return error.InvalidManifest;
-    try validateSkillName(manifest.name);
-    return try allocator.dupe(u8, manifest.name);
-}
-
 const SKILL_AUDIT_MAX_FILE_BYTES: usize = 512 * 1024;
-const SKILL_AUDIT_BLOCKED_PATTERNS = [_][]const u8{
-    "rm -rf /",
-    "sudo rm -rf /",
-    "dd if=/dev/zero",
-    "mkfs",
-    "curl | sh",
-    "wget | sh",
-    "chmod 777 /",
-    ":(){:|:&};:",
+const SKILL_SCRIPT_SUFFIXES = [_][]const u8{
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".ksh",
+    ".fish",
+    ".ps1",
+    ".bat",
+    ".cmd",
 };
 
-fn shouldAuditFileContent(path: []const u8) bool {
-    const name = std.fs.path.basename(path);
-    if (std.mem.eql(u8, name, "SKILL.md") or std.mem.eql(u8, name, "SKILL.toml")) return true;
-    return std.mem.endsWith(u8, name, ".sh") or
-        std.mem.endsWith(u8, name, ".bash") or
-        std.mem.endsWith(u8, name, ".zsh") or
-        std.mem.endsWith(u8, name, ".command") or
-        std.mem.endsWith(u8, name, ".ps1") or
-        std.mem.endsWith(u8, name, ".bat") or
-        std.mem.endsWith(u8, name, ".cmd");
+fn startsWithAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i < needle.len) : (i += 1) {
+        if (std.ascii.toLower(haystack[i]) != std.ascii.toLower(needle[i])) return false;
+    }
+    return true;
 }
 
-fn auditSkillFileContent(allocator: std.mem.Allocator, file_path: []const u8) !void {
-    if (!shouldAuditFileContent(file_path)) return;
+fn endsWithAsciiIgnoreCase(haystack: []const u8, suffix: []const u8) bool {
+    if (suffix.len == 0) return true;
+    if (haystack.len < suffix.len) return false;
+    return startsWithAsciiIgnoreCase(haystack[haystack.len - suffix.len ..], suffix);
+}
 
-    const content = std.fs.cwd().readFileAlloc(allocator, file_path, SKILL_AUDIT_MAX_FILE_BYTES) catch
+fn findAsciiIgnoreCaseFrom(haystack: []const u8, needle: []const u8, start: usize) ?usize {
+    if (needle.len == 0) return start;
+    if (haystack.len < needle.len or start > haystack.len - needle.len) return null;
+    var i = start;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var matched = true;
+        var j: usize = 0;
+        while (j < needle.len) : (j += 1) {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) return i;
+    }
+    return null;
+}
+
+fn isWordByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+fn containsWordIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    var search_start: usize = 0;
+    while (findAsciiIgnoreCaseFrom(haystack, needle, search_start)) |pos| {
+        const left_ok = pos == 0 or !isWordByte(haystack[pos - 1]);
+        const right_idx = pos + needle.len;
+        const right_ok = right_idx >= haystack.len or !isWordByte(haystack[right_idx]);
+        if (left_ok and right_ok) return true;
+        search_start = pos + 1;
+    }
+    return false;
+}
+
+fn hasScriptSuffix(path: []const u8) bool {
+    const lowered = std.fs.path.basename(path);
+    for (SKILL_SCRIPT_SUFFIXES) |suffix| {
+        if (endsWithAsciiIgnoreCase(lowered, suffix)) return true;
+    }
+    return false;
+}
+
+fn isMarkdownFile(path: []const u8) bool {
+    const lowered = std.fs.path.basename(path);
+    return endsWithAsciiIgnoreCase(lowered, ".md") or
+        endsWithAsciiIgnoreCase(lowered, ".markdown");
+}
+
+fn isTomlFile(path: []const u8) bool {
+    return endsWithAsciiIgnoreCase(std.fs.path.basename(path), ".toml");
+}
+
+fn hasShellShebang(path: []const u8) bool {
+    var file = if (std.fs.path.isAbsolute(path))
+        std.fs.openFileAbsolute(path, .{}) catch return false
+    else
+        std.fs.cwd().openFile(path, .{}) catch return false;
+    defer file.close();
+
+    var buf: [128]u8 = undefined;
+    const n = file.read(&buf) catch return false;
+    if (n < 2) return false;
+    const prefix = buf[0..n];
+    if (!std.mem.startsWith(u8, prefix, "#!")) return false;
+
+    return containsAsciiIgnoreCase(prefix, "sh") or
+        containsAsciiIgnoreCase(prefix, "bash") or
+        containsAsciiIgnoreCase(prefix, "zsh") or
+        containsAsciiIgnoreCase(prefix, "pwsh") or
+        containsAsciiIgnoreCase(prefix, "powershell");
+}
+
+fn containsPipeToShell(content: []const u8, command: []const u8) bool {
+    var search_start: usize = 0;
+    while (findAsciiIgnoreCaseFrom(content, command, search_start)) |cmd_pos| {
+        var line_end = cmd_pos;
+        while (line_end < content.len and content[line_end] != '\n' and content[line_end] != '\r' and (line_end - cmd_pos) < 240) : (line_end += 1) {}
+        const window = content[cmd_pos..line_end];
+        if (std.mem.indexOfScalar(u8, window, '|')) |pipe_pos| {
+            const after_pipe = std.mem.trim(u8, window[pipe_pos + 1 ..], " \t");
+            if (startsWithAsciiIgnoreCase(after_pipe, "sh") or
+                startsWithAsciiIgnoreCase(after_pipe, "bash") or
+                startsWithAsciiIgnoreCase(after_pipe, "zsh"))
+            {
+                return true;
+            }
+        }
+        search_start = cmd_pos + command.len;
+    }
+    return false;
+}
+
+fn containsNetcatExec(content: []const u8) bool {
+    if (!containsAsciiIgnoreCase(content, "nc") and !containsAsciiIgnoreCase(content, "ncat")) return false;
+    return containsAsciiIgnoreCase(content, " -e");
+}
+
+fn detectHighRiskSnippet(content: []const u8) bool {
+    if (containsPipeToShell(content, "curl")) return true;
+    if (containsPipeToShell(content, "wget")) return true;
+    if (containsAsciiIgnoreCase(content, "invoke-expression") or containsWordIgnoreCase(content, "iex")) return true;
+    if (containsAsciiIgnoreCase(content, "rm -rf /")) return true;
+    if (containsNetcatExec(content)) return true;
+    if (containsAsciiIgnoreCase(content, "dd if=")) return true;
+    if (containsAsciiIgnoreCase(content, "mkfs")) return true;
+    if (containsAsciiIgnoreCase(content, ":(){:|:&};:")) return true;
+    return false;
+}
+
+fn containsShellChaining(command: []const u8) bool {
+    const blocked = [_][]const u8{ "&&", "||", ";", "\n", "\r", "`", "$(" };
+    for (blocked) |needle| {
+        if (std.mem.indexOf(u8, command, needle) != null) return true;
+    }
+    return false;
+}
+
+fn normalizeMarkdownTarget(raw_target: []const u8) []const u8 {
+    var trimmed = std.mem.trim(u8, raw_target, " \t\r\n");
+    if (trimmed.len >= 2 and trimmed[0] == '<' and trimmed[trimmed.len - 1] == '>') {
+        trimmed = trimmed[1 .. trimmed.len - 1];
+    }
+    const split_at = std.mem.indexOfAny(u8, trimmed, " \t\r\n") orelse trimmed.len;
+    return trimmed[0..split_at];
+}
+
+fn stripQueryAndFragment(target: []const u8) []const u8 {
+    var end = target.len;
+    if (std.mem.indexOfScalar(u8, target, '#')) |idx| end = @min(end, idx);
+    if (std.mem.indexOfScalar(u8, target, '?')) |idx| end = @min(end, idx);
+    return target[0..end];
+}
+
+fn urlScheme(target: []const u8) ?[]const u8 {
+    const colon = std.mem.indexOfScalar(u8, target, ':') orelse return null;
+    if (colon == 0 or colon + 1 >= target.len) return null;
+    const scheme = target[0..colon];
+    for (scheme) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '+' and ch != '-' and ch != '.') return null;
+    }
+    return scheme;
+}
+
+fn looksLikeAbsolutePath(target: []const u8) bool {
+    if (target.len == 0) return false;
+    if (target[0] == '/' or target[0] == '\\') return true;
+    if (target.len >= 3 and std.ascii.isAlphabetic(target[0]) and target[1] == ':' and (target[2] == '/' or target[2] == '\\')) return true;
+    if (std.mem.startsWith(u8, target, "~/")) return true;
+
+    var i: usize = 0;
+    while (i < target.len and (target[i] == '/' or target[i] == '\\')) : (i += 1) {}
+    const start = i;
+    while (i < target.len and target[i] != '/' and target[i] != '\\') : (i += 1) {}
+    if (i > start and std.mem.eql(u8, target[start..i], "..")) return true;
+    return false;
+}
+
+fn pathWithinRoot(path: []const u8, root: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    if (path.len == root.len) return true;
+    const sep = path[root.len];
+    return sep == '/' or sep == '\\';
+}
+
+fn isRegularFile(path: []const u8) bool {
+    var file = if (std.fs.path.isAbsolute(path))
+        std.fs.openFileAbsolute(path, .{}) catch return false
+    else
+        std.fs.cwd().openFile(path, .{}) catch return false;
+    file.close();
+    return true;
+}
+
+fn auditMarkdownLinkTarget(
+    allocator: std.mem.Allocator,
+    canonical_root: []const u8,
+    source_path: []const u8,
+    raw_target: []const u8,
+) !void {
+    const normalized = normalizeMarkdownTarget(raw_target);
+    if (normalized.len == 0 or normalized[0] == '#') return;
+
+    if (urlScheme(normalized)) |scheme| {
+        if (std.mem.eql(u8, scheme, "http") or std.mem.eql(u8, scheme, "https") or std.mem.eql(u8, scheme, "mailto")) {
+            if (isMarkdownFile(normalized)) return error.SkillSecurityAuditFailed;
+            return;
+        }
         return error.SkillSecurityAuditFailed;
+    }
+
+    const stripped = stripQueryAndFragment(normalized);
+    if (stripped.len == 0) return;
+    if (looksLikeAbsolutePath(stripped)) return error.SkillSecurityAuditFailed;
+    if (hasScriptSuffix(stripped)) return error.SkillSecurityAuditFailed;
+    if (!isMarkdownFile(stripped)) return;
+
+    const source_parent = std.fs.path.dirname(source_path) orelse return error.SkillSecurityAuditFailed;
+    const linked_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ source_parent, stripped });
+    defer allocator.free(linked_path);
+
+    const linked_canonical = std.fs.cwd().realpathAlloc(allocator, linked_path) catch
+        return error.SkillSecurityAuditFailed;
+    defer allocator.free(linked_canonical);
+
+    if (!pathWithinRoot(linked_canonical, canonical_root)) return error.SkillSecurityAuditFailed;
+    if (!isRegularFile(linked_canonical)) return error.SkillSecurityAuditFailed;
+}
+
+fn auditMarkdownContent(
+    allocator: std.mem.Allocator,
+    canonical_root: []const u8,
+    source_path: []const u8,
+    content: []const u8,
+) !void {
+    var i: usize = 0;
+    while (i < content.len) : (i += 1) {
+        if (content[i] != '[') continue;
+
+        var close_bracket = i + 1;
+        while (close_bracket < content.len and content[close_bracket] != ']') : (close_bracket += 1) {}
+        if (close_bracket >= content.len or close_bracket + 1 >= content.len or content[close_bracket + 1] != '(') continue;
+
+        var close_paren = close_bracket + 2;
+        while (close_paren < content.len and content[close_paren] != ')') : (close_paren += 1) {}
+        if (close_paren >= content.len) break;
+
+        const raw_target = content[close_bracket + 2 .. close_paren];
+        try auditMarkdownLinkTarget(allocator, canonical_root, source_path, raw_target);
+        i = close_paren;
+    }
+}
+
+fn auditTomlContent(content: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+
+        const eq_idx = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq_idx], " \t");
+        if (!std.mem.eql(u8, key, "command")) continue;
+
+        const command = parseTomlStringLiteral(line[eq_idx + 1 ..]) orelse continue;
+        if (containsShellChaining(command)) return error.SkillSecurityAuditFailed;
+        if (detectHighRiskSnippet(command)) return error.SkillSecurityAuditFailed;
+    }
+
+    if (detectHighRiskSnippet(content)) return error.SkillSecurityAuditFailed;
+}
+
+fn auditSkillFileContent(
+    allocator: std.mem.Allocator,
+    canonical_root: []const u8,
+    file_path: []const u8,
+) !void {
+    if (hasScriptSuffix(file_path) or hasShellShebang(file_path)) return error.SkillSecurityAuditFailed;
+
+    const markdown = isMarkdownFile(file_path);
+    const toml = isTomlFile(file_path);
+    if (!markdown and !toml) return;
+
+    const content = std.fs.cwd().readFileAlloc(allocator, file_path, SKILL_AUDIT_MAX_FILE_BYTES) catch |err| switch (err) {
+        error.FileTooBig => return error.SkillSecurityAuditFailed,
+        else => return error.SkillSecurityAuditFailed,
+    };
     defer allocator.free(content);
 
-    if (std.mem.indexOfScalar(u8, content, 0) != null) return; // likely binary
+    if (std.mem.indexOfScalar(u8, content, 0) != null) return error.SkillSecurityAuditFailed;
+    if (detectHighRiskSnippet(content)) return error.SkillSecurityAuditFailed;
 
-    for (SKILL_AUDIT_BLOCKED_PATTERNS) |pattern| {
-        if (containsAsciiIgnoreCase(content, pattern)) {
-            return error.SkillSecurityAuditFailed;
-        }
-    }
+    if (markdown) try auditMarkdownContent(allocator, canonical_root, file_path, content);
+    if (toml) try auditTomlContent(content);
 }
 
 fn pathIsSymlink(path: []const u8) !bool {
@@ -607,13 +971,16 @@ fn pathIsSymlink(path: []const u8) !bool {
 
 fn auditSkillDirectory(allocator: std.mem.Allocator, root_dir_path: []const u8) !void {
     if (try pathIsSymlink(root_dir_path)) return error.SkillSecurityAuditFailed;
+    const canonical_root = std.fs.cwd().realpathAlloc(allocator, root_dir_path) catch
+        return error.SkillSecurityAuditFailed;
+    defer allocator.free(canonical_root);
 
     var stack: std.ArrayListUnmanaged([]u8) = .empty;
     errdefer {
         for (stack.items) |p| allocator.free(p);
         stack.deinit(allocator);
     }
-    try stack.append(allocator, try allocator.dupe(u8, root_dir_path));
+    try stack.append(allocator, try allocator.dupe(u8, canonical_root));
 
     while (stack.items.len > 0) {
         const current = stack.pop().?;
@@ -640,7 +1007,7 @@ fn auditSkillDirectory(allocator: std.mem.Allocator, root_dir_path: []const u8) 
                 return error.SkillSecurityAuditFailed;
             }
 
-            auditSkillFileContent(allocator, entry_path) catch |err| {
+            auditSkillFileContent(allocator, canonical_root, entry_path) catch |err| {
                 allocator.free(entry_path);
                 return err;
             };
@@ -727,18 +1094,6 @@ fn pathExists(path: []const u8) bool {
     return true;
 }
 
-fn writeGeneratedSkillManifest(allocator: std.mem.Allocator, target_dir: []const u8, skill_name: []const u8) !void {
-    const target_manifest = try std.fmt.allocPrint(allocator, "{s}/skill.json", .{target_dir});
-    defer allocator.free(target_manifest);
-    if (pathExists(target_manifest)) return;
-
-    const manifest_json = try std.fmt.allocPrint(allocator, "{{\"name\": \"{s}\"}}", .{skill_name});
-    defer allocator.free(manifest_json);
-    const f = try std.fs.createFileAbsolute(target_manifest, .{});
-    defer f.close();
-    try f.writeAll(manifest_json);
-}
-
 fn hasSkillMarkers(allocator: std.mem.Allocator, dir_path: []const u8) !bool {
     const md = try std.fmt.allocPrint(allocator, "{s}/SKILL.md", .{dir_path});
     defer allocator.free(md);
@@ -747,6 +1102,17 @@ fn hasSkillMarkers(allocator: std.mem.Allocator, dir_path: []const u8) !bool {
     const toml = try std.fmt.allocPrint(allocator, "{s}/SKILL.toml", .{dir_path});
     defer allocator.free(toml);
     return pathExists(toml);
+}
+
+fn hasSkillJson(allocator: std.mem.Allocator, dir_path: []const u8) !bool {
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/skill.json", .{dir_path});
+    defer allocator.free(manifest_path);
+    return pathExists(manifest_path);
+}
+
+fn hasInstallableSkillContent(allocator: std.mem.Allocator, dir_path: []const u8) !bool {
+    if (try hasSkillJson(allocator, dir_path)) return true;
+    return hasSkillMarkers(allocator, dir_path);
 }
 
 const CopyDirPair = struct {
@@ -817,7 +1183,6 @@ fn installSkillDirectoryToWorkspace(
     source_path: []const u8,
     workspace_dir: []const u8,
     skill_name: []const u8,
-    ensure_manifest: bool,
 ) !void {
     try validateSkillName(skill_name);
     try auditSkillDirectory(allocator, source_path);
@@ -844,15 +1209,6 @@ fn installSkillDirectoryToWorkspace(
         }
         return err;
     };
-
-    if (ensure_manifest) {
-        writeGeneratedSkillManifest(allocator, target_path, skill_name) catch |err| {
-            if (!target_existed) {
-                std.fs.deleteTreeAbsolute(target_path) catch {};
-            }
-            return err;
-        };
-    }
 
     auditSkillDirectory(allocator, target_path) catch |err| {
         if (!target_existed) {
@@ -894,31 +1250,16 @@ fn installSkillsFromRepositoryCollection(
 
         const skill_source_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ collection_path, entry.name });
         defer allocator.free(skill_source_path);
-        const manifest_path = try std.fmt.allocPrint(allocator, "{s}/skill.json", .{skill_source_path});
-        defer allocator.free(manifest_path);
-
-        if (pathExists(manifest_path)) {
-            installSkillFromPath(allocator, skill_source_path, workspace_dir) catch |err| {
+        installSkillFromPath(allocator, skill_source_path, workspace_dir) catch |err| switch (err) {
+            error.ManifestNotFound => continue,
+            else => {
                 const msg = std.fmt.allocPrint(allocator, "failed to install skill from repository collection entry '{s}'", .{entry.name}) catch null;
                 if (msg) |m| {
                     defer allocator.free(m);
                     setInstallErrorDetail(allocator, detail_out, m);
                 }
                 return err;
-            };
-            installed_count += 1;
-            continue;
-        }
-
-        if (!(hasSkillMarkers(allocator, skill_source_path) catch false)) continue;
-
-        installSkillDirectoryToWorkspace(allocator, skill_source_path, workspace_dir, entry.name, true) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "failed to install marker-based skill from repository collection entry '{s}'", .{entry.name}) catch null;
-            if (msg) |m| {
-                defer allocator.free(m);
-                setInstallErrorDetail(allocator, detail_out, m);
-            }
-            return err;
+            },
         };
         installed_count += 1;
     }
@@ -996,49 +1337,13 @@ fn installSkillFromGit(
         std.fs.deleteTreeAbsolute(cloned_dir) catch {};
     };
 
+    try removeGitMetadata(cloned_dir);
     auditSkillDirectory(allocator, cloned_dir) catch |err| {
         setInstallErrorDetail(allocator, detail_out, "skill security audit failed on cloned repository");
         return err;
     };
-    try removeGitMetadata(cloned_dir);
 
-    const maybe_manifest_name = readValidatedManifestName(allocator, cloned_dir) catch |err| switch (err) {
-        error.ManifestNotFound => null,
-        else => return err,
-    };
-
-    if (maybe_manifest_name) |manifest_name| {
-        defer allocator.free(manifest_name);
-        const target_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ skills_dir_path, manifest_name });
-        defer allocator.free(target_path);
-
-        if (!std.mem.eql(u8, cloned_dir, target_path)) {
-            if (pathExists(target_path)) {
-                installSkillFromPath(allocator, cloned_dir, workspace_dir) catch |err| {
-                    setInstallErrorDetail(allocator, detail_out, "git clone succeeded, but skill import failed");
-                    return err;
-                };
-                return;
-            }
-            std.fs.renameAbsolute(cloned_dir, target_path) catch |err| {
-                setInstallErrorDetail(allocator, detail_out, "git clone succeeded, but failed to finalize skill directory name");
-                return err;
-            };
-            cleanup_cloned_dir = false;
-        }
-
-        auditSkillDirectory(allocator, target_path) catch |err| {
-            setInstallErrorDetail(allocator, detail_out, "skill security audit failed after installation");
-            return err;
-        };
-        cleanup_cloned_dir = false;
-        return;
-    }
-
-    if (try hasSkillMarkers(allocator, cloned_dir)) {
-        const clone_name = std.fs.path.basename(cloned_dir);
-        try validateSkillName(clone_name);
-        try writeGeneratedSkillManifest(allocator, cloned_dir, clone_name);
+    if (try hasInstallableSkillContent(allocator, cloned_dir)) {
         auditSkillDirectory(allocator, cloned_dir) catch |err| {
             setInstallErrorDetail(allocator, detail_out, "skill security audit failed after installation");
             return err;
@@ -1052,7 +1357,7 @@ fn installSkillFromGit(
             setInstallErrorDetail(
                 allocator,
                 detail_out,
-                "repository does not contain an installable skill.json at root or installable entries under skills/",
+                "repository does not contain an installable root skill (skill.json/SKILL.toml/SKILL.md) or installable entries under skills/",
             );
         }
         return err;
@@ -1090,9 +1395,8 @@ pub fn installSkill(allocator: std.mem.Allocator, source: []const u8, workspace_
     return installSkillWithDetail(allocator, source, workspace_dir, null);
 }
 
-/// Install a skill by copying its directory into workspace_dir/skills/<name>/.
-/// If skill.json exists, its `name` is used.
-/// If skill.json is missing, falls back to directory basename when SKILL.md exists.
+/// Install a skill by copying its directory into workspace_dir/skills/<source-dirname>/.
+/// Destination directory naming follows zeroclaw local install behavior.
 pub fn installSkillFromPath(allocator: std.mem.Allocator, source_path: []const u8, workspace_dir: []const u8) !void {
     const source_abs = std.fs.cwd().realpathAlloc(allocator, source_path) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return error.ManifestNotFound,
@@ -1100,21 +1404,11 @@ pub fn installSkillFromPath(allocator: std.mem.Allocator, source_path: []const u
     };
     defer allocator.free(source_abs);
 
-    const manifest_name = readValidatedManifestName(allocator, source_abs) catch |err| switch (err) {
-        error.ManifestNotFound => null,
-        else => return err,
-    };
-    defer if (manifest_name) |name| allocator.free(name);
+    if (!(try hasInstallableSkillContent(allocator, source_abs))) return error.ManifestNotFound;
 
-    if (manifest_name) |name| {
-        return installSkillDirectoryToWorkspace(allocator, source_abs, workspace_dir, name, false);
-    }
-
-    if (!(try hasSkillMarkers(allocator, source_abs))) return error.ManifestNotFound;
-
-    const fallback_name = try deriveSkillNameFromSourcePath(allocator, source_abs);
-    defer allocator.free(fallback_name);
-    return installSkillDirectoryToWorkspace(allocator, source_abs, workspace_dir, fallback_name, true);
+    const source_dir_name = try deriveSkillNameFromSourcePath(allocator, source_abs);
+    defer allocator.free(source_dir_name);
+    return installSkillDirectoryToWorkspace(allocator, source_abs, workspace_dir, source_dir_name);
 }
 
 /// Copy a file from src to dst. Supports both absolute and relative paths.
@@ -1746,6 +2040,71 @@ test "loadSkill without skill.json falls back to markdown-only skill" {
     try std.testing.expect(skill.available);
 }
 
+test "loadSkill reads metadata from SKILL.toml" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/toml-meta");
+    {
+        const f = try tmp.dir.createFile("skills/toml-meta/SKILL.toml", .{});
+        defer f.close();
+        try f.writeAll(
+            \\[skill]
+            \\name = "from-toml"
+            \\description = "TOML metadata"
+            \\version = "1.2.3"
+            \\author = "toml-author"
+        );
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const skill_dir = try std.fs.path.join(allocator, &.{ base, "skills", "toml-meta" });
+    defer allocator.free(skill_dir);
+
+    const skill = try loadSkill(allocator, skill_dir);
+    defer freeSkill(allocator, &skill);
+
+    try std.testing.expectEqualStrings("from-toml", skill.name);
+    try std.testing.expectEqualStrings("1.2.3", skill.version);
+    try std.testing.expectEqualStrings("TOML metadata", skill.description);
+    try std.testing.expectEqualStrings("toml-author", skill.author);
+}
+
+test "loadSkill prefers SKILL.toml metadata over skill.json" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/dual");
+    {
+        const f = try tmp.dir.createFile("skills/dual/SKILL.toml", .{});
+        defer f.close();
+        try f.writeAll(
+            \\[skill]
+            \\name = "toml-name"
+            \\description = "toml wins"
+        );
+    }
+    {
+        const f = try tmp.dir.createFile("skills/dual/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"json-name\", \"description\": \"json\"}");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const skill_dir = try std.fs.path.join(allocator, &.{ base, "skills", "dual" });
+    defer allocator.free(skill_dir);
+
+    const skill = try loadSkill(allocator, skill_dir);
+    defer freeSkill(allocator, &skill);
+
+    try std.testing.expectEqualStrings("toml-name", skill.name);
+    try std.testing.expectEqualStrings("toml wins", skill.description);
+}
+
 test "loadSkill missing manifest returns error" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2024,6 +2383,110 @@ test "auditSkillDirectory allows large non-script files" {
     try auditSkillDirectory(allocator, source);
 }
 
+test "auditSkillDirectory rejects script suffix files" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("source");
+    {
+        const f = try tmp.dir.createFile("source/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("# Safe doc");
+    }
+    {
+        const f = try tmp.dir.createFile("source/install.sh", .{});
+        defer f.close();
+        try f.writeAll("echo unsafe");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const source = try std.fs.path.join(allocator, &.{ base, "source" });
+    defer allocator.free(source);
+
+    try std.testing.expectError(error.SkillSecurityAuditFailed, auditSkillDirectory(allocator, source));
+}
+
+test "auditSkillDirectory rejects shell shebang files" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("source");
+    {
+        const f = try tmp.dir.createFile("source/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("# Safe doc");
+    }
+    {
+        const f = try tmp.dir.createFile("source/tool", .{});
+        defer f.close();
+        try f.writeAll("#!/bin/bash\necho unsafe");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const source = try std.fs.path.join(allocator, &.{ base, "source" });
+    defer allocator.free(source);
+
+    try std.testing.expectError(error.SkillSecurityAuditFailed, auditSkillDirectory(allocator, source));
+}
+
+test "auditSkillDirectory rejects markdown links escaping skill root" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("source");
+    {
+        const f = try tmp.dir.createFile("source/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("# Skill\nSee [escape](../outside.md)");
+    }
+    {
+        const f = try tmp.dir.createFile("outside.md", .{});
+        defer f.close();
+        try f.writeAll("# outside");
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const source = try std.fs.path.join(allocator, &.{ base, "source" });
+    defer allocator.free(source);
+
+    try std.testing.expectError(error.SkillSecurityAuditFailed, auditSkillDirectory(allocator, source));
+}
+
+test "auditSkillDirectory rejects TOML tool command with shell chaining" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("source");
+    {
+        const f = try tmp.dir.createFile("source/SKILL.toml", .{});
+        defer f.close();
+        try f.writeAll(
+            \\[skill]
+            \\name = "unsafe-toml"
+            \\description = "unsafe"
+            \\
+            \\[[tools]]
+            \\name = "danger"
+            \\kind = "shell"
+            \\command = "echo ok && rm -rf /"
+        );
+    }
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const source = try std.fs.path.join(allocator, &.{ base, "source" });
+    defer allocator.free(source);
+
+    try std.testing.expectError(error.SkillSecurityAuditFailed, auditSkillDirectory(allocator, source));
+}
+
 test "installSkill and removeSkill roundtrip" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2067,7 +2530,7 @@ test "installSkill and removeSkill roundtrip" {
     try std.testing.expectEqualStrings("# Instructions\nInstall me.", skills[0].instructions);
 
     // Remove
-    try removeSkill(allocator, "installable", workspace);
+    try removeSkill(allocator, "source", workspace);
 
     // Verify removal
     const after = try listSkills(allocator, workspace);
@@ -2108,7 +2571,7 @@ test "installSkillFromPath copies full source directory" {
 
     try installSkillFromPath(allocator, source, workspace);
 
-    const installed_payload = try std.fs.path.join(allocator, &.{ workspace, "skills", "with-assets", "assets", "payload.txt" });
+    const installed_payload = try std.fs.path.join(allocator, &.{ workspace, "skills", "source", "assets", "payload.txt" });
     defer allocator.free(installed_payload);
     const bytes = try std.fs.cwd().readFileAlloc(allocator, installed_payload, 1024);
     defer allocator.free(bytes);
@@ -2142,10 +2605,6 @@ test "installSkillFromPath supports markdown-only source directory" {
     const content = try std.fs.cwd().readFileAlloc(allocator, installed_path, 1024);
     defer allocator.free(content);
     try std.testing.expectEqualStrings("# Markdown only install", content);
-
-    const generated_manifest = try std.fs.path.join(allocator, &.{ workspace, "skills", "source-md", "skill.json" });
-    defer allocator.free(generated_manifest);
-    try std.testing.expect(pathExists(generated_manifest));
 }
 
 test "installSkillFromPath supports relative source path" {
@@ -2179,7 +2638,7 @@ test "installSkillFromPath supports relative source path" {
 
     try installSkillFromPath(allocator, source_rel, workspace);
 
-    const installed = try std.fs.path.join(allocator, &.{ workspace, "skills", "relative-install", "SKILL.md" });
+    const installed = try std.fs.path.join(allocator, &.{ workspace, "skills", "source-rel", "SKILL.md" });
     defer allocator.free(installed);
     const content = try std.fs.cwd().readFileAlloc(allocator, installed, 1024);
     defer allocator.free(content);
@@ -2212,11 +2671,15 @@ test "installSkillFromPath supports SKILL.toml-only source directory" {
 
     try installSkillFromPath(allocator, source, workspace);
 
-    const installed_manifest = try std.fs.path.join(allocator, &.{ workspace, "skills", "source-toml", "skill.json" });
-    defer allocator.free(installed_manifest);
-    const manifest = try std.fs.cwd().readFileAlloc(allocator, installed_manifest, 1024);
-    defer allocator.free(manifest);
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"name\": \"source-toml\"") != null);
+    const installed_toml = try std.fs.path.join(allocator, &.{ workspace, "skills", "source-toml", "SKILL.toml" });
+    defer allocator.free(installed_toml);
+    try std.testing.expect(pathExists(installed_toml));
+
+    const skills = try listSkills(allocator, workspace);
+    defer freeSkills(allocator, skills);
+    try std.testing.expectEqual(@as(usize, 1), skills.len);
+    try std.testing.expectEqualStrings("example-skill", skills[0].name);
+    try std.testing.expectEqualStrings("toml-only", skills[0].description);
 }
 
 test "installSkillWithDetail rejects insecure git source" {
@@ -2372,11 +2835,9 @@ test "installSkillFromGit installs all skills from repository skills directory" 
     try std.testing.expect(found_http);
     try std.testing.expect(found_review);
 
-    const generated_manifest = try std.fs.path.join(allocator, &.{ workspace, "skills", "http_request", "skill.json" });
-    defer allocator.free(generated_manifest);
-    const manifest = try std.fs.cwd().readFileAlloc(allocator, generated_manifest, 1024);
-    defer allocator.free(manifest);
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"name\": \"http_request\"") != null);
+    const installed_skill_md = try std.fs.path.join(allocator, &.{ workspace, "skills", "http_request", "SKILL.md" });
+    defer allocator.free(installed_skill_md);
+    try std.testing.expect(pathExists(installed_skill_md));
 }
 
 test "installSkillFromGit installs SKILL.toml entry from repository skills directory" {
@@ -2415,16 +2876,11 @@ test "installSkillFromGit installs SKILL.toml entry from repository skills direc
     const skills = try listSkills(allocator, workspace);
     defer freeSkills(allocator, skills);
     try std.testing.expectEqual(@as(usize, 1), skills.len);
-    try std.testing.expectEqualStrings("toml_only", skills[0].name);
-
-    const generated_manifest = try std.fs.path.join(allocator, &.{ workspace, "skills", "toml_only", "skill.json" });
-    defer allocator.free(generated_manifest);
-    const manifest = try std.fs.cwd().readFileAlloc(allocator, generated_manifest, 1024);
-    defer allocator.free(manifest);
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"name\": \"toml_only\"") != null);
+    try std.testing.expectEqualStrings("toml-only", skills[0].name);
+    try std.testing.expectEqualStrings("marker-only entry", skills[0].description);
 }
 
-test "installSkillFromGit keeps full repo content when manifest name differs" {
+test "installSkillFromGit keeps clone directory name when manifest name differs" {
     const allocator = std.testing.allocator;
     if (!checkBinaryExists(allocator, "git")) return error.SkipZigTest;
 
@@ -2463,7 +2919,7 @@ test "installSkillFromGit keeps full repo content when manifest name differs" {
 
     try installSkillFromGit(allocator, repo, workspace, null);
 
-    const installed_skill_path = try std.fs.path.join(allocator, &.{ workspace, "skills", "renamed-skill" });
+    const installed_skill_path = try std.fs.path.join(allocator, &.{ workspace, "skills", "repo" });
     defer allocator.free(installed_skill_path);
     const payload_path = try std.fs.path.join(allocator, &.{ installed_skill_path, "assets", "payload.txt" });
     defer allocator.free(payload_path);
@@ -2472,9 +2928,7 @@ test "installSkillFromGit keeps full repo content when manifest name differs" {
     defer allocator.free(payload);
     try std.testing.expectEqualStrings("asset-data", payload);
 
-    const old_clone_name_path = try std.fs.path.join(allocator, &.{ workspace, "skills", "repo" });
-    defer allocator.free(old_clone_name_path);
-    try std.testing.expect(!pathExists(old_clone_name_path));
+    try std.testing.expect(pathExists(installed_skill_path));
 }
 
 test "installSkillFromPath rejects missing manifest" {
@@ -2516,7 +2970,7 @@ test "removeSkill rejects unsafe names" {
     try std.testing.expectError(error.UnsafeName, removeSkill(allocator, "..", "/tmp"));
 }
 
-test "installSkillFromPath rejects unsafe skill names" {
+test "installSkillFromPath uses source directory name even when manifest name is unsafe" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2524,13 +2978,20 @@ test "installSkillFromPath rejects unsafe skill names" {
     try tmp.dir.makePath("source");
     try tmp.dir.makePath("workspace");
 
-    // Write a manifest with a malicious name
+    // Manifest name must not influence destination directory naming.
     {
         const rel = try std.fs.path.join(allocator, &.{ "source", "skill.json" });
         defer allocator.free(rel);
         const f = try tmp.dir.createFile(rel, .{});
         defer f.close();
         try f.writeAll("{\"name\": \"../../../etc/passwd\"}");
+    }
+    {
+        const rel = try std.fs.path.join(allocator, &.{ "source", "SKILL.md" });
+        defer allocator.free(rel);
+        const f = try tmp.dir.createFile(rel, .{});
+        defer f.close();
+        try f.writeAll("# safe content");
     }
 
     const base = try tmp.dir.realpathAlloc(allocator, ".");
@@ -2540,7 +3001,10 @@ test "installSkillFromPath rejects unsafe skill names" {
     const workspace = try std.fs.path.join(allocator, &.{ base, "workspace" });
     defer allocator.free(workspace);
 
-    try std.testing.expectError(error.UnsafeName, installSkillFromPath(allocator, source, workspace));
+    try installSkillFromPath(allocator, source, workspace);
+    const installed = try std.fs.path.join(allocator, &.{ workspace, "skills", "source", "skill.json" });
+    defer allocator.free(installed);
+    try std.testing.expect(pathExists(installed));
 }
 
 // ── Community Sync Tests ────────────────────────────────────────
